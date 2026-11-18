@@ -476,6 +476,7 @@ int8_t Arr_RX[32] = {0};
 static uint8_t Coop_PollAbort(void);
 static uint8_t Adj_WaitLoop(void);
 static uint8_t Test_WaitLoop(void);
+static uint8_t GO_DownTest(void);
 void Clear_All_PID(void);
 
 uint8_t FENG_Motor_ON(void){
@@ -539,6 +540,11 @@ static uint8_t  g_ae_near = 0xFF;
 static uint8_t  g_ae_pd = 0xFF;
 static uint8_t  g_ae_st = 0xFF;
 static uint32_t g_ae_last_tx_ms = 0;
+/* 作业模式: Pi 真实采完发 DONE / 中止发 ABORT, 结束零速保持 */
+static volatile uint8_t g_work_pi_done = 0;
+static volatile uint8_t g_work_pi_abort = 0;
+static volatile uint8_t g_work_pi_cap_ok = 0; /* Pi 回 OK CAP 后置 1; 未确认时保持环内补发 CAP */
+static uint8_t g_work_key_armed = 1; /* 松手后再认 KEY1/2/5, 避免连发连跳多档/连开 CAP */
 
 /* 解析 ADJ, 帧载荷 → 存入 g_adj_* */
 static void Adj_ParseStore(const uint8_t *buf){
@@ -725,8 +731,42 @@ static uint8_t Coop_TakeAbort(const uint8_t *buf){
 
 static uint8_t Coop_PollAbort(void){
   uint8_t buf[32];
-  if(safe_RxPacket(buf) != 0) return 0;
-  return Coop_TakeAbort(buf);
+  uint8_t hit = 0;
+  /* 抽干 FIFO: 只读一包时, 前面的非中止帧会把 KEY2 堵到下一圈才处理 */
+  while(safe_RxPacket(buf) == 0){
+    if(Coop_TakeAbort(buf)) hit = 1;
+  }
+  return hit;
+}
+
+/* 作业采集保持中: KEY2/STOP/摇杆才中止.
+ * KEY1/5/7 连发忽略; KEY3/4/6 仍可调风机. */
+static uint8_t Work_PollAbort(void){
+  uint8_t buf[32];
+  uint8_t hit = 0;
+  while(safe_RxPacket(buf) == 0){
+    if(Coop_FindFrame(buf, STOP_CMD)){
+      memset(Arr_RX, 0, 32);
+      hit = 1;
+      continue;
+    }
+    if(Coop_IsProtoFrame(buf)) continue;
+    if(buf[1] == 0 && buf[2] == 0 &&
+       (buf[5] == 3 || buf[5] == 4 || buf[5] == 6)){
+      FENG_Motor_SET((int8_t)buf[5]);
+      continue;
+    }
+    if(buf[5] == 1 || buf[5] == 5 || buf[5] == 7) continue;
+    if(buf[5] == 0){
+      g_work_key_armed = 1;
+      continue;
+    }
+    if(buf[5] == 2 || buf[1] != 0 || buf[2] != 0){
+      memcpy(Arr_RX, buf, 32);
+      hit = 1;
+    }
+  }
+  return hit;
 }
 
 static uint8_t Coop_WaitFrame(const char *frame){
@@ -792,15 +832,68 @@ static uint8_t Coop_DelayReport(uint32_t ms){
   return 0;
 }
 
+static void Pi_Reply(const char *s);
 static void Pi_SendCap(void);
 static void Ae_Poll(void);
 
-/* 舵机作业: A给很小向上转速顶住, B短刹; 顺带抽 Pi 预测结果(不阻塞) */
-static uint8_t Coop_ServoAHold(uint32_t ms){
+/* 零速主动保持(仅供上电自跑测试用): 目标0速闭环, 微滑立即反向出力(带积分抗持续外力),
+ * 完全静止时断电; 风机加一档(1639); 结构与ServoAHold一致(报IMU/抽Pi/可中止)。
+ * 真实协同的ServoAHold保持抱死不变 */
+static uint8_t Coop_ServoHoldActive(uint32_t ms){
+  uint32_t t0 = HAL_GetTick();
+  float hold_i_a = 0.0f, hold_i_b = 0.0f;
+  Clear_All_PID();
+  FENG_Motor_SET(3);
+  while(HAL_GetTick() - t0 < ms){
+    float va = MA_V_GET();
+    float vb = MB_V_GET();
+    int out_a, out_b;
+    hold_i_a += (-va) * 90.0f * 0.01f;
+    if(hold_i_a > 4000.0f) hold_i_a = 4000.0f; else if(hold_i_a < -4000.0f) hold_i_a = -4000.0f;
+    out_a = (int)((-va) * 18.0f + hold_i_a);
+    if(out_a > 4199) out_a = 4199; else if(out_a < -4199) out_a = -4199;
+    if(out_a > 0){
+      __HAL_TIM_SET_COMPARE(&htim4,TIM_CHANNEL_1,0);
+      __HAL_TIM_SET_COMPARE(&htim4,TIM_CHANNEL_2,(uint16_t)out_a);
+    } else if(out_a < 0){
+      __HAL_TIM_SET_COMPARE(&htim4,TIM_CHANNEL_1,(uint16_t)(-out_a));
+      __HAL_TIM_SET_COMPARE(&htim4,TIM_CHANNEL_2,0);
+    } else {
+      MA_STOP();
+    }
+    hold_i_b += (-vb) * 90.0f * 0.01f;
+    if(hold_i_b > 4000.0f) hold_i_b = 4000.0f; else if(hold_i_b < -4000.0f) hold_i_b = -4000.0f;
+    out_b = (int)((-vb) * 18.0f + hold_i_b);
+    if(out_b > 4199) out_b = 4199; else if(out_b < -4199) out_b = -4199;
+    if(out_b > 0){
+      __HAL_TIM_SET_COMPARE(&htim4,TIM_CHANNEL_3,0);
+      __HAL_TIM_SET_COMPARE(&htim4,TIM_CHANNEL_4,(uint16_t)out_b);
+    } else if(out_b < 0){
+      __HAL_TIM_SET_COMPARE(&htim4,TIM_CHANNEL_3,(uint16_t)(-out_b));
+      __HAL_TIM_SET_COMPARE(&htim4,TIM_CHANNEL_4,0);
+    } else {
+      MB_STOP();
+    }
+    Coop_ReportIMU();
+    Ae_Poll();
+    if(Coop_PollAbort()) return 1;
+    HAL_Delay(10);
+  }
+  motor_STOP();
+  __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, 4199);
+  __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_2, 4199);
+  return 0;
+}
+
+/* 抱死对照版(仅供上电自跑测试A/B用): 与旧版ServoAHold相同的纯抱死保持,
+ * A轮CH1/CH2 4199刹车 + B轮刹车, 风机加一档(1639); 无主动出力 */
+static uint8_t Coop_ServoHoldBrake(uint32_t ms){
   uint32_t t0 = HAL_GetTick();
   Clear_All_PID();
+  FENG_Motor_SET(3);
   while(HAL_GetTick() - t0 < ms){
-    PID_MA(-8.0f);
+    __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, 4199);
+    __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_2, 4199);
     MB_STOP();
     Coop_ReportIMU();
     Ae_Poll();
@@ -811,6 +904,84 @@ static uint8_t Coop_ServoAHold(uint32_t ms){
   __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, 4199);
   __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_2, 4199);
   return 0;
+}
+
+/* 舵机作业(协同AUTO用): 零速主动保持 — 与测试模式同一套逻辑,
+ * 目标0速闭环: 微滑立即反向出力(带积分), 静止断电; 风机加一档(1639)增强摩擦 */
+static uint8_t Coop_ServoAHold(uint32_t ms){
+  return Coop_ServoHoldActive(ms);
+}
+
+/* 作业模式: 与 AUTO 探头段同一套零速纠偏。本地计时到点就抬(AUTO 是 22s),
+ * Pi DONE 若提前到达则提前结束; ABORT/遥控中止返回 1。
+ * 返回 0=到点或 DONE  1=中止 */
+static uint8_t Coop_ServoHoldUntilPiDone(uint32_t max_ms){
+  uint32_t t0 = HAL_GetTick();
+  uint32_t last_cap_tx = 0;
+  float hold_i_a = 0.0f, hold_i_b = 0.0f;
+  Clear_All_PID();
+  /* 风机已在 ProbeCycle 爬到 1539, 保持环不再加档 */
+  NRF24L01_RX_Mode();
+  while(1){
+    float va = MA_V_GET();
+    float vb = MB_V_GET();
+    int out_a, out_b;
+    /* 先抽遥控/中止, 再控轮/上报, 避免 TX flush 丢掉 KEY2 */
+    if(Work_PollAbort() || Arr_RX[5] == 2){
+      Arr_RX[5] = 0;
+      printf("WORK: RC abort during hold\r\n");
+      return 1;
+    }
+    /* 作业抬回以本地计时为准(25s); 忽略 Pi DONE, 避免 Pi 22s watchdog 比采完更早抬 */
+    if(g_work_pi_abort){
+      printf("WORK: Pi ABORT\r\n");
+      return 1;
+    }
+    if((uint32_t)(HAL_GetTick() - t0) >= max_ms){
+      printf("WORK: hold done %lums (local)\r\n", (unsigned long)max_ms);
+      motor_STOP();
+      __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, 4199);
+      __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_2, 4199);
+      return 0;
+    }
+    /* 开机首轮常见: CAP 发出时 Pi 服务尚未就绪. 未收到 OK CAP 则保持环内补发 */
+    if(!g_work_pi_cap_ok){
+      uint32_t now = HAL_GetTick();
+      if(last_cap_tx == 0 || (uint32_t)(now - last_cap_tx) >= 250u){
+        Pi_Reply("CAP\n");
+        last_cap_tx = now;
+      }
+    }
+    hold_i_a += (-va) * 90.0f * 0.01f;
+    if(hold_i_a > 4000.0f) hold_i_a = 4000.0f; else if(hold_i_a < -4000.0f) hold_i_a = -4000.0f;
+    out_a = (int)((-va) * 18.0f + hold_i_a);
+    if(out_a > 4199) out_a = 4199; else if(out_a < -4199) out_a = -4199;
+    if(out_a > 0){
+      __HAL_TIM_SET_COMPARE(&htim4,TIM_CHANNEL_1,0);
+      __HAL_TIM_SET_COMPARE(&htim4,TIM_CHANNEL_2,(uint16_t)out_a);
+    } else if(out_a < 0){
+      __HAL_TIM_SET_COMPARE(&htim4,TIM_CHANNEL_1,(uint16_t)(-out_a));
+      __HAL_TIM_SET_COMPARE(&htim4,TIM_CHANNEL_2,0);
+    } else {
+      MA_STOP();
+    }
+    hold_i_b += (-vb) * 90.0f * 0.01f;
+    if(hold_i_b > 4000.0f) hold_i_b = 4000.0f; else if(hold_i_b < -4000.0f) hold_i_b = -4000.0f;
+    out_b = (int)((-vb) * 18.0f + hold_i_b);
+    if(out_b > 4199) out_b = 4199; else if(out_b < -4199) out_b = -4199;
+    if(out_b > 0){
+      __HAL_TIM_SET_COMPARE(&htim4,TIM_CHANNEL_3,0);
+      __HAL_TIM_SET_COMPARE(&htim4,TIM_CHANNEL_4,(uint16_t)out_b);
+    } else if(out_b < 0){
+      __HAL_TIM_SET_COMPARE(&htim4,TIM_CHANNEL_3,(uint16_t)(-out_b));
+      __HAL_TIM_SET_COMPARE(&htim4,TIM_CHANNEL_4,0);
+    } else {
+      MB_STOP();
+    }
+    Coop_ReportIMU();
+    Ae_Poll();
+    HAL_Delay(10);
+  }
 }
 
 /* 探头从 DUO_NUM 线性慢抬到收回位(499), 共 lift_ms;
@@ -908,10 +1079,12 @@ uint8_t GO_DOWN(float _degree){
       if(micros() - t_start > 30000000u) break;
       if((roll) >= _degree){
         float d_left = roll - _degree;
-        if (d_left < 5.0f) {
-          PID_IMU(0, -15);
-        } else if (d_left < 10.0f) {
-          PID_IMU(0, -40);
+        if (d_left < 10.0f) {
+          /* 最后10°: 速度随剩余角线性衰减(-40→0), 到线时轮子已近停,
+           * 消除"急断+滑行"造成的单轮多走/变斜 */
+          float v = 40.0f * d_left / 10.0f;
+          if(v < 3.0f) v = 3.0f;              /* 保底蠕速: 防静摩擦卡死吃掉30s超时 */
+          PID_IMU(0, (int)(-v));
         } else {
           PID_IMU(0, -100);
         }
@@ -929,22 +1102,22 @@ uint8_t GO_DOWN(float _degree){
 uint8_t GO_UP(float _degree){
   uint32_t loop_time = micros();
   uint32_t t_start = micros();
-  uint8_t fan_cut2 = 0; /* 近顶(剩余<30°)降吸两档, 只做一次, 保持到 AUTO 结束 */
+  uint8_t fan_cut2 = 0; /* 近顶(剩余<35°)降吸两档, 只做一次, 保持到 AUTO 结束 */
   while(1){
     if (micros() - loop_time >= 10000) {
       loop_time = micros();
       if(micros() - t_start > 30000000u) return 2; /* 超时: 返回2, 调用方不再上报DONE */
       if((roll) <= _degree ){
         float d_left = _degree - roll;
-        /* 回来剩余角 <30°: 吸力降两档(每档 FENG_UP), 直到 FENG_Motor_OFF */
-        if(!fan_cut2 && d_left < 30.0f){
+        /* 回来剩余角 <35°: 吸力降两档(每档 FENG_UP), 直到 FENG_Motor_OFF */
+        if(!fan_cut2 && d_left < 35.0f){
           fan_cut2 = 1;
           if(FENG_PWM_SET > (uint16_t)(939u + 2u * FENG_UP))
             FENG_PWM_SET = (uint16_t)(FENG_PWM_SET - 2u * FENG_UP);
           else
             FENG_PWM_SET = 939;
           __HAL_TIM_SET_COMPARE(&htim5, TIM_CHANNEL_1, FENG_PWM_SET);
-          printf("GO_UP: fan-2 @<%ddeg -> %u\r\n", 30, (unsigned)FENG_PWM_SET);
+          printf("GO_UP: fan-2 @<%ddeg -> %u\r\n", 35, (unsigned)FENG_PWM_SET);
         }
         if (d_left < 5.0f) {
           PID_IMU(0, 40);   /* 最后5°减速, 与下行对称, 防过冲急刹 */
@@ -1048,29 +1221,46 @@ void AUTO(void){
 
     if(Compose_IMU()) { g_coop_report_en = 0; motor_STOP(); return; }
     Clear_All_PID();
-    if(GO_DOWN(-90)) { g_coop_report_en = 0; motor_STOP(); return; }
+    if(GO_DownTest()) { g_coop_report_en = 0; motor_STOP(); return; }   /* 下行移植自测试模式: -88°停+反向脉冲掐死 */
     motor_STOP();
-    /* 底部静止: A轮CH1/CH2都4199刹车, B轮仍刹车 */
+    /* 下滑到位(-85°): A轮CH1/CH2都4199刹车, B轮仍刹车 */
     __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, 4199);
     __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_2, 4199);
 
     if(Coop_DelayReport(200)) { g_coop_report_en = 0; motor_STOP(); return; }
-    DUO_Motor_ON(DUO_NUM);
-    /* 通知 Pi 常驻服务开始采集; 不等待预测, 抬升不阻塞 */
-    g_ae_pending = 0; g_ae_sent_ok = 0; g_ae_last_tx_ms = 0;
-    Pi_SendCap();
-    /* 探头下压作业 25s */
-    if(Coop_ServoAHold(25000)) { g_coop_report_en = 0; motor_STOP(); return; }
-    /* 作业后再加吸到1639, 再慢抬探头+往回爬 */
-    FENG_PWM_SET = 1639;
-    __HAL_TIM_SET_COMPARE(&htim5,TIM_CHANNEL_1,FENG_PWM_SET);
-    if(Coop_DelayReport(500)) { g_coop_report_en = 0; motor_STOP(); return; }
-
-    Clear_All_PID();
-    /* 探头 5s 慢抬; 抬起满 1s 后开始 GO_UP (与剩余抬升重叠)
-     * 0=到位 1=中止 2=超时。超时/中止都不上报DONE, 保持吸力回手动 */
-    if(Coop_LiftThenGoUp(roll_Compose, 5000, 1000)) {
-      g_coop_report_en = 0; motor_STOP(); return;
+    /* 探头柔压(移植自测试模式): 499→778(25°) 线性1s(原瞬跳1055≈50°) */
+    {
+      uint32_t duo_saved = DUO_NUM;
+      uint16_t press_from = 499, press_to;
+      uint32_t press_ms = 1000;
+      uint32_t pt0 = HAL_GetTick();
+      uint16_t pos;
+      DUO_NUM = 778;                      /* 协同下压角度: 25°(2026-11-04 起, 原50°) */
+      press_to = (uint16_t)DUO_NUM;
+      while((uint32_t)(HAL_GetTick() - pt0) < press_ms){
+        pos = press_from + (uint16_t)(((uint32_t)(press_to - press_from)) * (HAL_GetTick() - pt0) / press_ms);
+        DUO_Motor_ON(pos);
+        Coop_ReportIMU();
+        Ae_Poll();
+        if(Coop_PollAbort()) { g_coop_report_en = 0; DUO_NUM = duo_saved; motor_STOP(); return; }
+        HAL_Delay(10);
+      }
+      DUO_Motor_ON(press_to);
+      /* 通知 Pi 常驻服务开始采集; 不等待预测, 抬升不阻塞 */
+      g_ae_pending = 0; g_ae_sent_ok = 0; g_ae_last_tx_ms = 0;
+      Pi_SendCap();
+      /* 探头下压作业 22s */
+      if(Coop_ServoAHold(22000)) { g_coop_report_en = 0; DUO_NUM = duo_saved; motor_STOP(); return; }
+      /* 作业后再加吸到1639, 再慢抬探头+往回爬 */
+      FENG_PWM_SET = 1639;
+      __HAL_TIM_SET_COMPARE(&htim5,TIM_CHANNEL_1,FENG_PWM_SET);
+      Clear_All_PID();
+      /* 探头 5s 慢抬; 抬起满 1s 后开始 GO_UP (与剩余抬升重叠)
+       * 0=到位 1=中止 2=超时。超时/中止都不上报DONE, 保持吸力回手动 */
+      if(Coop_LiftThenGoUp(roll_Compose, 5000, 1000)) {
+        g_coop_report_en = 0; DUO_NUM = duo_saved; motor_STOP(); return;
+      }
+      DUO_NUM = duo_saved;                /* 恢复1055: 下一轮循环/手动用 */
     }
     motor_STOP();
 
@@ -1088,6 +1278,109 @@ void AUTO(void){
     FENG_Motor_OFF();
     Clear_All_PID();
     Coop_SendFrame(ACKD_RSP);
+  }
+}
+
+/* ================= 上电自跑测试模式(单独新增, 不改任何既有逻辑) =================
+ * POWERON_SELF_TEST=1: 上电等5s → 自动跑一遍精简AUTO(无NRF握手/无树莓派CAP):
+ *   开风机1539稳1s → GO_DownTest(下到-88°,反向脉冲掐死) → 刹车200ms
+ *   → 柔压1s至探头25° → 作业20s(零速主动保持+风机1639) → 慢抬5s+回程GO_UP
+ *   → 关风机停机, MODE回9手操待机
+ * 保留STOP/遥控中止; 正式版把宏置0即完全关闭本段 */
+#define POWERON_SELF_TEST 0
+
+/* 测试模式专用下行: 斜坡锚定-90(速度形状与协同一致), 实际停止点提前到-88,
+ * 到点瞬间"反向脉冲"(反接制动)主动杀掉残余转速再归中抱死 —— 真·掐死。
+ * 仅上电自跑调用; 协同的GO_DOWN保持原样(-90, 比例减速+自然滑停) */
+#define DOWNTEST_STOP_DEG   (-88.0f)   /* 实际停止点 */
+#define DOWNTEST_RAMP_DEG   (-90.0f)   /* 斜坡锚点(只决定速度形状) */
+#define DOWNKILL_DUTY       2000u      /* 反向脉冲占空比(0~4199) */
+#define DOWNKILL_MS         80u        /* 反向脉冲时长 */
+
+static uint8_t GO_DownTest(void){
+  uint32_t loop_time = micros();
+  uint32_t t_start = micros();
+  while(1){
+    if (micros() - loop_time >= 10000) {
+      loop_time = micros();
+      if(micros() - t_start > 30000000u) break;   /* 30s超时 */
+      if((roll) >= DOWNTEST_STOP_DEG){
+        float d_ramp = roll - DOWNTEST_RAMP_DEG;  /* 距斜坡锚点的剩余 */
+        float v;
+        if (d_ramp < 10.0f) {
+          v = 40.0f * d_ramp / 10.0f;             /* -88°处 v=8, 斜坡连续 */
+        } else {
+          v = 100.0f;
+        }
+        PID_IMU(0, (int)(-v));
+      }
+      else{
+        break;                                    /* roll < -88 → 到停止点 */
+      }
+      Coop_ReportIMU();
+      if(Coop_PollAbort()) return 1;
+    }
+  }
+  /* 掐死: 反向(上行)脉冲主动杀掉下行残余转速(反接制动) → 归中抱死 */
+  {
+    uint32_t k0 = HAL_GetTick();
+    while(HAL_GetTick() - k0 < DOWNKILL_MS){
+      __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, 0);
+      __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_2, DOWNKILL_DUTY);   /* A轮上行 */
+      __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_3, 0);
+      __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_4, DOWNKILL_DUTY);   /* B轮上行 */
+      Coop_ReportIMU();
+      if(Coop_PollAbort()) return 1;
+      HAL_Delay(10);
+    }
+  }
+  motor_STOP();                                   /* 归中: 四通道4199抱死 */
+  return 0;
+}
+
+static void PowerOnSelfTest(void){
+  printf("\r\n[SELFTEST] power-on self test\r\n");
+  while(HAL_GetTick() < 5000u){          /* 上电起5s */
+    if(Coop_PollAbort()){ printf("[SELFTEST] aborted\r\n"); return; }
+    HAL_Delay(10);
+  }
+  if(FENG_Motor_ON()) return;
+  if(Coop_DelayReport(1000)) return;
+  if(Compose_IMU()) return;
+  Clear_All_PID();
+  if(GO_DownTest()) { motor_STOP(); return; }   /* 测试模式: 下到-88°反向脉冲掐死 */
+  motor_STOP();
+  __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, 4199);
+  __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_2, 4199);
+  if(Coop_DelayReport(200)) return;
+  {
+    uint32_t duo_saved = DUO_NUM;
+    uint16_t press_from = 499, press_to;
+    uint32_t press_ms = 1000;               /* 柔压时长: 原0s瞬跳, 1s缓压 */
+    uint32_t pt0;
+    uint16_t pos;
+    DUO_NUM = 778;                          /* 测试模式: 探头下压25°(778; 协同为1055≈50°) */
+    press_to = (uint16_t)DUO_NUM;
+    /* 柔压: 499→778 线性压2s(原瞬跳), 期间报IMU/可中止 */
+    pt0 = HAL_GetTick();
+    while((uint32_t)(HAL_GetTick() - pt0) < press_ms){
+      pos = press_from + (uint16_t)(((uint32_t)(press_to - press_from)) * (HAL_GetTick() - pt0) / press_ms);
+      DUO_Motor_ON(pos);
+      Coop_ReportIMU();
+      Ae_Poll();
+      if(Coop_PollAbort()) { DUO_NUM = duo_saved; return; }
+      HAL_Delay(10);
+    }
+    DUO_Motor_ON(press_to);
+    if(Coop_ServoHoldActive(20000)) { DUO_NUM = duo_saved; return; }  /* 作业20s: 零速主动保持+风机1639, 无CAP */
+    FENG_PWM_SET = 1639;
+    __HAL_TIM_SET_COMPARE(&htim5,TIM_CHANNEL_1,FENG_PWM_SET);
+    Clear_All_PID();
+    if(Coop_LiftThenGoUp(roll_Compose, 5000, 1000)) { motor_STOP(); DUO_NUM = duo_saved; return; }
+    motor_STOP();
+    FENG_Motor_OFF();
+    DUO_NUM = duo_saved;                    /* 恢复1055, 不影响后续协同/手动 */
+    printf("[SELFTEST] done\r\n");
   }
 }
 /**
@@ -1691,30 +1984,104 @@ static uint8_t Test_WaitLoop(void){
   }
 }
 
+/* 作业模式(MODE=11):
+ * KEY1/2 探头逐级 ±142; KEY3/4/6 风机; KEY5 发 CAP+保持 → 采完抬回.
+ * 采集保持中 KEY2=中止抬回关风机. */
+#define WORK_HOLD_MS      25000u  /* 本地保持(覆盖冷启动+20s采); DONE 可提前结束 */
+#define WORK_HOME_PWM     499u
+#define WORK_LIFT_MS      1000u
+
+/* stop_fan: 1=关风机(939). 中止关风机; 正常结束只抬探头保留吸力 */
+static void WorkMode_LiftHome(uint8_t stop_fan){
+  uint16_t from = DUO_PWM_SET;
+  uint16_t to = (uint16_t)WORK_HOME_PWM;
+  uint32_t t0 = HAL_GetTick();
+  uint16_t pos;
+  if(from <= to){
+    DUO_PWM_SET = to;
+    DUO_Motor_OFF();
+    motor_STOP();
+  } else {
+    while((uint32_t)(HAL_GetTick() - t0) < WORK_LIFT_MS){
+      pos = from - (uint16_t)(((uint32_t)(from - to)) * (HAL_GetTick() - t0) / WORK_LIFT_MS);
+      DUO_PWM_SET = pos;
+      DUO_Motor_ON(pos);
+      HAL_Delay(10);
+    }
+    DUO_PWM_SET = to;
+    DUO_Motor_OFF();
+    motor_STOP();
+  }
+  if(stop_fan){
+    FENG_PWM_SET = 939;
+    __HAL_TIM_SET_COMPARE(&htim5, TIM_CHANNEL_1, FENG_PWM_SET);
+    printf("WORK: lift home + fan off\r\n");
+  } else {
+    printf("WORK: lift home\r\n");
+  }
+}
+
+/* KEY5: 发 CAP + 零速保持 → 采完/超时抬回探头(保留风机). 返回 0=正常 1=中止 */
+static uint8_t WorkMode_CaptureCycle(void){
+  printf("WORK: CAP+hold %lus (probe already set)\r\n",
+         (unsigned long)(WORK_HOLD_MS / 1000u));
+  Clear_All_PID();
+  NRF24L01_RX_Mode();
+  g_work_pi_done = 0;
+  g_work_pi_abort = 0;
+  g_ae_pending = 0; g_ae_sent_ok = 0; g_ae_last_tx_ms = 0;
+  g_work_pi_cap_ok = 0;
+  Pi_SendCap();
+
+  if(Coop_ServoHoldUntilPiDone(WORK_HOLD_MS)){
+    printf("WORK: abort during hold\r\n");
+    WorkMode_LiftHome(1);
+    return 1;
+  }
+
+  WorkMode_LiftHome(0);  /* 采完只抬探头, 风机由 KEY3/4/6 管 */
+  printf("WORK: capture done, probe home\r\n");
+  return 0;
+}
+
 static void ApplyRemoteKey(int8_t key){
   if(key == 0) return;
   if(MODE == 11){
-    /* 作业模式: 风机(3增/4减/6停); 舵机1=一点一点下压(+142/按) 2=一点一点抬升(-142/按);
-       key9退出; key8=纠偏自检(ADJ_SELF_TEST=1时进独立TSTA纠偏测试环) */
+    /* KEY1/2 探头逐级; KEY3/4/6 风机; KEY5 CAP采集; KEY9退出 */
     if(key == 9){
-      MODE = 9;                 /* key=9 退出作业模式, 回手操 */
+      MODE = 9;
       Clear_All_PID();
       printf("WORK MODE off\r\n");
     } else if(key == 8 && ADJ_SELF_TEST){
-      /* bench: enter standalone adj test (wait mother ADJ/GOON/TSTE) */
       printf("ADJ self test: enter TSTA path\r\n");
       g_tsta_pending = 1;
       MODE = 10;
     } else if(key == 1){
-      /* 下压: 一点一点往下(每按+142, 第一版行为), 不直接跳作业角 */
+      if(!g_work_key_armed) return;
+      g_work_key_armed = 0;
       DUO_Motor_SET(1);
-      printf("SERVO down %d\r\n", (int)DUO_PWM_SET);
+      printf("WORK: probe +1 pwm=%u\r\n", (unsigned)DUO_PWM_SET);
     } else if(key == 2){
-      /* 抬升: 一点一点往上(每按-142), 下限499(舵机规格) */
+      if(!g_work_key_armed) return;
+      g_work_key_armed = 0;
       DUO_Motor_SET(2);
-      printf("SERVO up %d\r\n", (int)DUO_PWM_SET);
-    } else if(key == 3 || key == 4 || key == 6){
+      printf("WORK: probe -1 pwm=%u\r\n", (unsigned)DUO_PWM_SET);
+    } else if(key == 5){
+      if(!g_work_key_armed) return;
+      g_work_key_armed = 0;
+      WorkMode_CaptureCycle();
+    } else if(key == 3 || key == 4){
+      /* 与探头一样: 松手再认下一档. 手柄连发时否则几十ms就冲到1800 */
+      if(!g_work_key_armed) return;
+      g_work_key_armed = 0;
       FENG_Motor_SET(key);
+      printf("WORK: fan %s pwm=%u\r\n",
+             (key == 3) ? "+1" : "-1", (unsigned)FENG_PWM_SET);
+    } else if(key == 6){
+      if(!g_work_key_armed) return;
+      g_work_key_armed = 0;
+      FENG_Motor_SET(6);
+      printf("WORK: fan stop pwm=%u\r\n", (unsigned)FENG_PWM_SET);
     }
     return;
   }
@@ -1785,8 +2152,34 @@ static void Pi_Reply(const char *s){
   HAL_UART_Transmit(&huart1, (uint8_t*)s, (uint16_t)strlen(s), 20);
 }
 
+/* 发 CAP 并短等 OK CAP; 失败仍返回(保持环会继续补发). AUTO/作业共用. */
+#define PI_CAP_ACK_MS   250u
+#define PI_CAP_TRIES    10u   /* 首轮最多约 2.5s 抢握手, 覆盖服务刚起来的窗口 */
 static void Pi_SendCap(void){
-  Pi_Reply("CAP\n");
+  uint8_t i;
+  g_work_pi_cap_ok = 0;
+  for(i = 0; i < PI_CAP_TRIES; i++){
+    uint32_t t0;
+    Pi_Reply("CAP\n");
+    t0 = HAL_GetTick();
+    while((uint32_t)(HAL_GetTick() - t0) < PI_CAP_ACK_MS){
+      Ae_Poll();
+      if(g_work_pi_cap_ok){
+        printf("CAP ACK ok\r\n");
+        return;
+      }
+      if(MODE == 11){
+        if(Work_PollAbort() || g_work_pi_abort || Arr_RX[5] == 2){
+          Arr_RX[5] = 0;
+          return;
+        }
+      } else {
+        if(Coop_PollAbort()) return;
+      }
+      HAL_Delay(10);
+    }
+  }
+  printf("CAP no ACK yet, hold will resend\r\n");
 }
 
 /* 与 Pi ae_uart / App AE_ST_TEXT 对齐:
@@ -1869,7 +2262,7 @@ static void Ae_TrySendNrf(void){
   }
 }
 
-/* AUTO 各循环空档调用: 抽串口结果 + 尝试 NRF 上送, 绝不长时间阻塞 */
+/* AUTO/作业空档调用: 抽串口结果 + 尝试 NRF 上送, 绝不长时间阻塞 */
 static void Ae_Poll(void){
   char cmd[PI_RX_LINE_MAX];
   uint8_t i;
@@ -1878,10 +2271,16 @@ static void Ae_Poll(void){
     pi_rx_ready = 0;
     if(cmd[0] == 'R' && cmd[1] == ','){
       Ae_ParseResultLine(cmd);
+    } else if(strcmp(cmd, "DONE") == 0){
+      g_work_pi_done = 1;                 /* 真实采完, 结束作业保持 */
+    } else if(strcmp(cmd, "ABORT") == 0){
+      g_work_pi_abort = 1;
+    } else if(strcmp(cmd, "OK CAP") == 0){
+      g_work_pi_cap_ok = 1;               /* 采集服务已接手 */
     } else if(strncmp(cmd, "OK", 2) == 0){
-      /* CAP/PING 应答, 忽略 */
+      /* PING 等其它应答, 忽略 */
     }
-    /* 其它指令留给主循环 Pi_CMD_Process; AUTO 内不执行手动键 */
+    /* 其它指令留给主循环 Pi_CMD_Process; 保持环内不执行手动键 */
   }
   Ae_TrySendNrf();
 }
@@ -1903,15 +2302,40 @@ static void Pi_CMD_Process(void){
     Ae_TrySendNrf();
     return;
   }
+  if(strcmp(cmd, "OK CAP") == 0){ g_work_pi_cap_ok = 1; return; }
   if(strncmp(cmd, "OK", 2) == 0){ return; }
 
-  if     (strcmp(cmd, "W")  == 0){ ApplyRemoteKey(7); Pi_Reply("OK W\n");  }
-  else if(strcmp(cmd, "X")  == 0){ ApplyRemoteKey(9); Pi_Reply("OK X\n");  }
+  /* S+/S-/GO 先回 OK 再动作, 避免 Pi 堵在等应答而收不到 CAP */
+  if     (strcmp(cmd, "W")  == 0){
+    Pi_Reply("OK W\n");
+    ApplyRemoteKey(7);                 /* 进 MODE=11, 不必再按遥控 KEY7 */
+  }
+  else if(strcmp(cmd, "X")  == 0){ Pi_Reply("OK X\n"); ApplyRemoteKey(9); }
   else if(strcmp(cmd, "F+") == 0){ ApplyRemoteKey(3); Pi_Reply("OK F+\n"); }
   else if(strcmp(cmd, "F-") == 0){ ApplyRemoteKey(4); Pi_Reply("OK F-\n"); }
   else if(strcmp(cmd, "F0") == 0){ ApplyRemoteKey(6); Pi_Reply("OK F0\n"); }
-  else if(strcmp(cmd, "S+") == 0){ ApplyRemoteKey(1); Pi_Reply("OK S+\n"); }
-  else if(strcmp(cmd, "S-") == 0){ ApplyRemoteKey(2); Pi_Reply("OK S-\n"); }
+  else if(strcmp(cmd, "S+") == 0 || strcmp(cmd, "GO") == 0){
+    Pi_Reply("OK S+\n");
+    /* 调试: S+/GO = KEY5 发 CAP(需先 W 进作业); 不再绑 KEY1 探头 */
+    if(MODE != 11) ApplyRemoteKey(7);
+    g_work_key_armed = 1;
+    ApplyRemoteKey(5);
+  }
+  else if(strcmp(cmd, "S-") == 0){
+    Pi_Reply("OK S-\n");
+    /* 调试急停: 抬回探头并关风机(空闲 KEY2 已改为逐级抬) */
+    WorkMode_LiftHome(1);
+  }
+  else if(strcmp(cmd, "ABORT") == 0){
+    /* 保持环内由 Ae_Poll 置位; 空闲时在 MODE=11 直接抬回 */
+    g_work_pi_abort = 1;
+    Pi_Reply("OK ABORT\n");
+    if(MODE == 11) ApplyRemoteKey(2);
+  }
+  else if(strcmp(cmd, "DONE") == 0){
+    g_work_pi_done = 1;
+    Pi_Reply("OK DONE\n");
+  }
   else if(cmd[0]=='F' && cmd[1]=='=' && cmd[2] != 0){
     v = atoi(cmd + 2);
     if(v >= 939 && v <= 1800){
@@ -1994,9 +2418,12 @@ int main(void)
   }
   NRF24L01_RX_Mode();
   while(HAL_GetTick() < 3000u);               //?3s?
-  MODE = 10;
+  /* 上电进手操(MODE=9), 便于树莓派 W/S+ 立刻生效。
+   * 旧逻辑 MODE=10 会卡在 Test_WaitLoop 等母机 COOP/TSTA, 期间不处理 USART1。
+   * 母机仍可通过 COOP/TSTA 帧切入 MODE=10。 */
+  MODE = 9;
   
-  printf("?\r\n");
+  printf("boot MODE=9 (Pi ready)\r\n");
   //???V_GET
   //????K9 K10
   
@@ -2004,6 +2431,12 @@ int main(void)
   //Flash_Read(Flash_ReadNUM,2);//????? ??????
   //printf("Flash TEST : %d , %d \r\n",Flash_ReadNUM[0],Flash_ReadNUM[1]);
   uint32_t last_ctrl_time = micros();
+
+#if POWERON_SELF_TEST
+  /* 上电自跑测试: 5s后自动跑一遍, 结束回手操; 宏置0时本段不存在, 行为与原来完全一致 */
+  PowerOnSelfTest();
+  MODE = 9;
+#endif
 
   while (1)
   {
@@ -2015,8 +2448,10 @@ int main(void)
       if(Test_WaitLoop() == 0){
         AUTO();
       }
-      /* 中止/正常退出: 保持吸力, 切手操; key=6 在此停风机 */
-      MODE = 9;
+      /* 中止/正常退出: 切手操; 若等待中已被 Pi 切到作业模式(11)则保留 */
+      if(MODE == 10){
+        MODE = 9;
+      }
       g_coop_report_en = 0;
       motor_STOP();
       if(Arr_RX[5] != 0){
@@ -2040,6 +2475,9 @@ int main(void)
           memset(Arr_RX, 0, 32);
           continue;
         }
+        if(Arr_RX[5] == 0){
+          g_work_key_armed = 1;
+        }
         if(Arr_RX[5] != 0){
           ApplyRemoteKey(Arr_RX[5]);
           Arr_RX[5] = 0;
@@ -2052,6 +2490,14 @@ int main(void)
         if(MODE == 9){
             /* 前端: 上/下=前后, 左/右=转向。空中帧相对车体顺时针转了90°, 这里转回来:
                原 [1]=前后 [2]=转向 → 实际前端上写入了[2]、左写入了[1] */
+            float fwd  = -(float)Arr_RX[2];
+            float yawc =  (float)Arr_RX[1];
+            PID_MA(-yawc*2.0f + fwd);
+            PID_MB( yawc*2.0f + fwd);
+        }
+        else if(MODE == 11){
+            /* 作业模式空闲(本版新增): 摇杆前后+原地转向, 与手操同混控;
+               采集保持期间主循环阻塞在保持环里不会到这里, 摇杆仍按 Work_PollAbort 视为中止 */
             float fwd  = -(float)Arr_RX[2];
             float yawc =  (float)Arr_RX[1];
             PID_MA(-yawc*2.0f + fwd);

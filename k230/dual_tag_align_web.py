@@ -55,7 +55,12 @@ AP_SSID = "k230-align"
 AP_PASS = "12345678"  # WPA，至少 8 位
 AP_CHANNEL = 6
 
-WIFI_TIMEOUT_S = 25
+WIFI_TIMEOUT_S = 25           # 兼容保留; STA 开机改用 WIFI_BOOT_WAIT_S
+# STA 掉线/上电连不上: 主循环定期检查; 仅 WIFI_MODE=sta 生效
+WIFI_BOOT_WAIT_S = 8          # 开机首次连 hotspot 最多等几秒; 失败不退出
+WIFI_CHECK_MS = 3000          # 多久检查一次是否在线
+WIFI_RECONNECT_MS = 5000      # 失败后再空等几毫秒才下次尝试
+WIFI_RECONNECT_WAIT_S = 8     # 单次 connect 最多等几秒(与上面不冲突)
 # UDP 自动发现（与母机/ESP32 子机同协议）
 DISCOVERY_PORT = 48899
 # 平板热点看不到已连设备的 IP, 光靠「App 问→板子答」可能因时机错过;
@@ -102,6 +107,8 @@ g_win = []
 g_jpeg = None
 g_ip = "0.0.0.0"
 g_wifi = None
+g_wifi_last_check_ms = 0
+g_wifi_last_reconnect_ms = 0
 g_boot_ms = 0
 g_udp_disc = None
 g_disc_recv = 0
@@ -191,17 +198,45 @@ def fuse_dual_obs(ta, tb, landmark_mm=None):
     lm = DUAL_TAG_SEP_MM if landmark_mm is None else landmark_mm
     ha = ta["hamming"] if "hamming" in ta else 0
     hb = tb["hamming"] if "hamming" in tb else 0
+    mid_u = 0.5 * (lo["u"] + hi["u"])
+    mid_v = 0.5 * (lo["v"] + hi["v"])
+    th = math.atan2(dy, dx)
+    # 标定用: 每枚码相对中点在「小ID→大ID」基线系下的偏移(mm)。
+    # 正 along = 该码朝中点在基线正方向上的分量; 单码反推据此恢复前后。
+    # 不用嵌套函数, 避免部分 MicroPython 兼容问题。
+    scale = lm / dist
+    cth = math.cos(th)
+    sth = math.sin(th)
+    du_lo = mid_u - lo["u"]
+    dv_lo = mid_v - lo["v"]
+    du_hi = mid_u - hi["u"]
+    dv_hi = mid_v - hi["v"]
+    tag_off = {
+        int(lo["id"]): {
+            "along_mm": (du_lo * cth + dv_lo * sth) * scale,
+            "perp_mm": (-du_lo * sth + dv_lo * cth) * scale,
+            "theta": lo["theta"],
+            "edge_a": lo["edge_a"],
+        },
+        int(hi["id"]): {
+            "along_mm": (du_hi * cth + dv_hi * sth) * scale,
+            "perp_mm": (-du_hi * sth + dv_hi * cth) * scale,
+            "theta": hi["theta"],
+            "edge_a": hi["edge_a"],
+        },
+    }
     return {
         "id": lo["id"],
         "id_b": hi["id"],
-        "u": 0.5 * (lo["u"] + hi["u"]),
-        "v": 0.5 * (lo["v"] + hi["v"]),
-        "theta": math.atan2(dy, dx),
+        "u": mid_u,
+        "v": mid_v,
+        "theta": th,
         "edge_a": dist,
         "edge_p": dist,
         "edge_px": dist,
         "landmark_mm": lm,
         "hamming": max(ha, hb),
+        "tag_off": tag_off,
     }
 
 
@@ -252,21 +287,93 @@ def obs_from_apriltag(tag):
     }
 
 
-def detect_dual_from_tags(tag_list):
+def _wrap_pi(a):
+    while a > math.pi:
+        a -= 2.0 * math.pi
+    while a < -math.pi:
+        a += 2.0 * math.pi
+    return a
+
+
+def synthesize_dual_from_one(tag, ref):
+    """只见一枚: 用标定记下的该码相对中点偏移 + 该码相对标定朝向, 反推中点。
+    前后由 /align/ref 双码实测决定 (码近远贴反会进 tag_off), 不写死正负号。"""
+    if ref is None or "tag_off" not in ref:
+        return None
+    tid = int(tag["id"])
+    offs = ref["tag_off"]
+    if tid not in offs:
+        return None
+    off = offs[tid]
+    ea = tag["edge_a"] if "edge_a" in tag else 0.0
+    if ea < 1e-3:
+        return None
+    dth = _wrap_pi(tag["theta"] - off["theta"])
+    if abs(dth) > (math.pi * 0.5):
+        dth = _wrap_pi(dth + math.pi)
+    th_now = _wrap_pi(ref["theta"] + dth)
+    mm_per_px = TAG_REAL_MM / ea
+    ux = math.cos(th_now)
+    uy = math.sin(th_now)
+    px = -uy
+    py = ux
+    along = off["along_mm"]
+    perp = off["perp_mm"]
+    mu = tag["u"] + (along * ux + perp * px) / mm_per_px
+    mv = tag["v"] + (along * uy + perp * py) / mm_per_px
+    sep_px = DUAL_TAG_SEP_MM / mm_per_px
+    ham = tag["hamming"] if "hamming" in tag else 0
+    lo_id = TAG_ID_A if TAG_ID_A <= TAG_ID_B else TAG_ID_B
+    hi_id = TAG_ID_B if TAG_ID_A <= TAG_ID_B else TAG_ID_A
+    return {
+        "id": lo_id,
+        "id_b": hi_id,
+        "u": mu,
+        "v": mv,
+        "theta": th_now,
+        "edge_a": sep_px,
+        "edge_p": sep_px,
+        "edge_px": sep_px,
+        "landmark_mm": DUAL_TAG_SEP_MM,
+        "hamming": ham,
+        "tags_used": 1,
+    }
+
+
+def detect_dual_from_tags(tags, allow_single=False):
+    """从 AprilTag 列表取双码中点观测。
+    allow_single=True 且已有标定 tag_off 时: 只见一枚也可按刚体反推中点。
+    记参考必须 allow_single=False (强制真实双码)。
+    第三返回值仍是原始 AprilTag 对象列表, 供 draw_overlays 画框。"""
     by_id = {}
-    for raw in tag_list:
-        obs = obs_from_apriltag(raw)
+    for t in tags:
+        obs = obs_from_apriltag(t)
         prev = by_id[obs["id"]] if obs["id"] in by_id else None
         if prev is None or obs["edge_a"] > prev["edge_a"]:
             by_id[obs["id"]] = obs
-    have_a = TAG_ID_A in by_id
-    have_b = TAG_ID_B in by_id
-    n = int(have_a) + int(have_b)
-    if n == 0:
-        return None, "no_tag", tag_list
-    if n == 1:
-        return None, "need_two_tags", tag_list
-    return fuse_dual_obs(by_id[TAG_ID_A], by_id[TAG_ID_B]), "ok", tag_list
+    has_a = TAG_ID_A in by_id
+    has_b = TAG_ID_B in by_id
+    if has_a and has_b:
+        fused = fuse_dual_obs(by_id[TAG_ID_A], by_id[TAG_ID_B])
+        fused["tags_used"] = 2
+        return fused, "ok", tags
+    if allow_single and g_ref is not None and "tag_off" in g_ref:
+        one = None
+        if has_a:
+            one = by_id[TAG_ID_A]
+        elif has_b:
+            one = by_id[TAG_ID_B]
+        if one is not None:
+            syn = synthesize_dual_from_one(one, g_ref)
+            if syn is not None:
+                return syn, "ok_single", tags
+    if not has_a and not has_b:
+        return None, "no_tags", tags
+    if not has_a:
+        return None, "need_tag_a", tags
+    if not has_b:
+        return None, "need_tag_b", tags
+    return None, "need_two_tags", tags
 
 
 def align_json_ok(dev, obs, dt_ms=0):
@@ -319,7 +426,11 @@ def push_consensus(obs):
         h = o["hamming"] if "hamming" in o else 0
         if h > ham:
             ham = h
-    return {
+    tags_used = 2
+    for o in g_win:
+        if "tags_used" in o and int(o["tags_used"]) < tags_used:
+            tags_used = int(o["tags_used"])
+    out = {
         "id": oid,
         "id_b": oid_b,
         "u": su / n,
@@ -330,7 +441,47 @@ def push_consensus(obs):
         "edge_px": se / n,
         "landmark_mm": lm,
         "hamming": ham,
+        "tags_used": tags_used,
     }
+    # 标定双码: 平均各码相对中点偏移。失败也不影响双码中点参考。
+    try:
+        off_acc = {}
+        off_n = {}
+        for o in g_win:
+            if "tag_off" not in o:
+                continue
+            to = o["tag_off"]
+            for tid in to:
+                off = to[tid]
+                tid = int(tid)
+                if tid not in off_acc:
+                    off_acc[tid] = {
+                        "along_mm": 0.0,
+                        "perp_mm": 0.0,
+                        "theta": 0.0,
+                        "edge_a": 0.0,
+                    }
+                    off_n[tid] = 0
+                off_acc[tid]["along_mm"] += float(off["along_mm"])
+                off_acc[tid]["perp_mm"] += float(off["perp_mm"])
+                off_acc[tid]["theta"] += float(off["theta"])
+                off_acc[tid]["edge_a"] += float(off["edge_a"])
+                off_n[tid] += 1
+        if off_acc:
+            tag_off = {}
+            for tid in off_acc:
+                acc = off_acc[tid]
+                nn = float(off_n[tid])
+                tag_off[tid] = {
+                    "along_mm": acc["along_mm"] / nn,
+                    "perp_mm": acc["perp_mm"] / nn,
+                    "theta": acc["theta"] / nn,
+                    "edge_a": acc["edge_a"] / nn,
+                }
+            out["tag_off"] = tag_off
+    except Exception as e:
+        print("[ALIGN-WEB] tag_off avg skip:", type(e).__name__, e)
+    return out
 
 
 def set_ref_from_obs(obs):
@@ -341,9 +492,23 @@ def set_ref_from_obs(obs):
         "theta": obs["theta"],
         "edge_a": obs["edge_a"],
     }
+    if "tag_off" in obs:
+        g_ref["tag_off"] = obs["tag_off"]
     g_last_reason = "ok"
-    print("[ALIGN-WEB] ref set u=%.1f v=%.1f theta=%.2fdeg edge=%.1f" % (
-        g_ref["u"], g_ref["v"], math.degrees(g_ref["theta"]), g_ref["edge_a"]))
+    off_s = ""
+    try:
+        if "tag_off" in g_ref:
+            parts = []
+            to = g_ref["tag_off"]
+            for tid in to:
+                off = to[tid]
+                parts.append("id%d:along=%.1f perp=%.1f" % (
+                    int(tid), off["along_mm"], off["perp_mm"]))
+            off_s = " " + " ".join(parts)
+    except Exception:
+        off_s = ""
+    print("[ALIGN-WEB] ref set u=%.1f v=%.1f theta=%.2fdeg edge=%.1f%s" % (
+        g_ref["u"], g_ref["v"], math.degrees(g_ref["theta"]), g_ref["edge_a"], off_s))
 
 
 def clear_ref():
@@ -433,8 +598,127 @@ def _ap_try_config(ap):
     return configured, last_err
 
 
-def wifi_connect():
+def _sta_iface():
+    try:
+        sta_if = network.STA_IF
+    except Exception:
+        sta_if = 0
+    return network.WLAN(sta_if)
+
+
+def _sta_is_up(sta):
+    """STA 是否已联网且有可用 IP。"""
+    if sta is None:
+        return False
+    try:
+        ip = sta.ifconfig()[0]
+    except Exception:
+        return False
+    if not ip or ip == "0.0.0.0":
+        return False
+    try:
+        if hasattr(sta, "isconnected"):
+            return bool(sta.isconnected())
+    except Exception:
+        pass
+    return True
+
+
+def _sta_do_connect(sta, wait_s, label="STA"):
+    """发起 connect 并短等; 成功更新 g_wifi/g_ip 返回 True。"""
     global g_wifi, g_ip
+    try:
+        if hasattr(sta, "active") and not sta.active():
+            sta.active(True)
+    except Exception:
+        pass
+    print("[ALIGN-WEB] %s connect ssid=%s ..." % (label, WIFI_SSID))
+    try:
+        sta.connect(WIFI_SSID, WIFI_PASS)
+    except TypeError:
+        try:
+            sta.connect(ssid=WIFI_SSID, key=WIFI_PASS)
+        except Exception as e:
+            print("[ALIGN-WEB] %s connect fail:" % label, e)
+            return False
+    except Exception as e:
+        print("[ALIGN-WEB] %s connect fail:" % label, e)
+        return False
+    if STA_STATIC_IP:
+        try:
+            sta.ifconfig(STA_STATIC_IP)
+        except Exception as e:
+            print("[ALIGN-WEB] STA static fail, keep DHCP:", e)
+    t0 = time.time()
+    while time.time() - t0 < wait_s:
+        try:
+            os.exitpoint()
+        except Exception:
+            pass
+        if _sta_is_up(sta):
+            g_wifi = sta
+            try:
+                g_ip = sta.ifconfig()[0]
+            except Exception:
+                pass
+            print("[ALIGN-WEB] %s ok ifconfig=%s" % (label, sta.ifconfig()))
+            return True
+        time.sleep(0.4)
+        print(".", end="")
+    print("")
+    print("[ALIGN-WEB] %s wait timeout %ss" % (label, wait_s))
+    return False
+
+
+def wifi_poll_reconnect():
+    """主循环调用: STA 未连上/掉线则按间隔重连。AP 模式直接返回。
+    上电热点未就绪时也靠这里一直重试, 不退出脚本。"""
+    global g_wifi, g_wifi_last_check_ms, g_wifi_last_reconnect_ms, g_ip
+    if network is None:
+        return
+    if WIFI_MODE.lower().strip() != "sta":
+        return
+    now = time.ticks_ms()
+    if g_wifi_last_check_ms and time.ticks_diff(now, g_wifi_last_check_ms) < WIFI_CHECK_MS:
+        return
+    g_wifi_last_check_ms = now
+    sta = g_wifi
+    if sta is None:
+        try:
+            sta = _sta_iface()
+            g_wifi = sta
+        except Exception as e:
+            print("[ALIGN-WEB] STA iface fail:", e)
+            return
+    if _sta_is_up(sta):
+        try:
+            ip = sta.ifconfig()[0]
+            if ip and ip != g_ip:
+                print("[ALIGN-WEB] STA ip change %s -> %s" % (g_ip, ip))
+                g_ip = ip
+        except Exception:
+            pass
+        return
+    # 未连上/掉线: 距「上次尝试结束」不足 WIFI_RECONNECT_MS 则先空等
+    if g_wifi_last_reconnect_ms and time.ticks_diff(
+            now, g_wifi_last_reconnect_ms) < WIFI_RECONNECT_MS:
+        return
+    print("[ALIGN-WEB] STA down/offline, reconnect…")
+    try:
+        stream_drop()
+    except Exception:
+        pass
+    ok = _sta_do_connect(sta, WIFI_RECONNECT_WAIT_S, label="STA-re")
+    # 时间戳记在尝试结束: 失败后再空等 WIFI_RECONNECT_MS, 与「单次等几秒」不打架
+    g_wifi_last_reconnect_ms = time.ticks_ms()
+    if not ok:
+        print("[ALIGN-WEB] STA-re fail; next try after %ds (开平板热点 %s)" % (
+            WIFI_RECONNECT_MS // 1000, WIFI_SSID))
+
+
+def wifi_connect():
+    """开机连网。STA 失败不抛错: 返回 None, 由主循环 wifi_poll_reconnect 继续试。"""
+    global g_wifi, g_ip, g_wifi_last_check_ms, g_wifi_last_reconnect_ms
     if network is None:
         raise RuntimeError("network module missing")
     mode = WIFI_MODE.lower().strip()
@@ -464,7 +748,6 @@ def wifi_connect():
             except Exception as e:
                 print("[ALIGN-WEB] AP re-active warn:", e)
             # Wait for IP / interface ready
-            ok_ip = False
             for _ in range(10):
                 time.sleep(0.5)
                 try:
@@ -487,53 +770,18 @@ def wifi_connect():
             print("[ALIGN-WEB] AP no usable IP on try %d, retry" % attempt)
             time.sleep(1.0)
         raise RuntimeError("AP bring-up failed after retries: %s" % last_err)
-    # STA
-    try:
-        sta_if = network.STA_IF
-    except Exception:
-        sta_if = 0
-    sta = network.WLAN(sta_if)
-    try:
-        if hasattr(sta, "active") and not sta.active():
-            sta.active(True)
-    except Exception:
-        pass
-    print("[ALIGN-WEB] Connecting STA ssid=%s ..." % WIFI_SSID)
-    try:
-        sta.connect(WIFI_SSID, WIFI_PASS)
-    except TypeError:
-        sta.connect(ssid=WIFI_SSID, key=WIFI_PASS)
-    if STA_STATIC_IP:
-        try:
-            sta.ifconfig(STA_STATIC_IP)
-            print("[ALIGN-WEB] STA static %s" % (STA_STATIC_IP,))
-        except Exception as e:
-            print("[ALIGN-WEB] STA static fail, keep DHCP:", e)
-    t0 = time.time()
-    while True:
-        try:
-            os.exitpoint()
-        except Exception:
-            pass
-        ip = sta.ifconfig()[0]
-        connected = False
-        try:
-            connected = sta.isconnected()
-        except Exception:
-            connected = ip != "0.0.0.0"
-        if connected and ip != "0.0.0.0":
-            g_ip = ip
-            g_wifi = sta
-            print("[ALIGN-WEB] STA ok ifconfig=%s" % (sta.ifconfig(),))
-            return g_ip
-        if time.time() - t0 > WIFI_TIMEOUT_S:
-            print("")
-            print("[ALIGN-WEB] STA timeout; 确认平板已开 %s 热点且密码 %s" % (WIFI_SSID, WIFI_PASS))
-            print("[ALIGN-WEB] 若只想直连板子调试, 把文件顶部 WIFI_MODE 改回 \"ap\" 后重启")
-            raise RuntimeError("WiFi STA timeout")
-        time.sleep(0.5)
-        print(".", end="")
-    return g_ip
+    # STA: 短等一次; 失败不退出, 后台按 WIFI_RECONNECT_MS 重试
+    sta = _sta_iface()
+    g_wifi = sta
+    g_wifi_last_check_ms = 0
+    g_wifi_last_reconnect_ms = 0
+    if _sta_do_connect(sta, WIFI_BOOT_WAIT_S, label="STA"):
+        g_wifi_last_check_ms = time.ticks_ms()
+        return g_ip
+    print("[ALIGN-WEB] STA boot miss; 确认平板热点 %s/%s" % (WIFI_SSID, WIFI_PASS))
+    print("[ALIGN-WEB] 不退出, 每 %ds 后台重连 (单次等 %ds)" % (
+        WIFI_RECONNECT_MS // 1000, WIFI_RECONNECT_WAIT_S))
+    return None
 
 
 # ---------- UDP 自动发现 (与母机/子机同协议) ----------
@@ -957,11 +1205,13 @@ def capture_preview(encode_jpeg=True):
             try:
                 gray = img_for_detect(img)
                 tags = gray.find_apriltags(families=TAG_FAMILIES)
-                fused, reason, tag_list = detect_dual_from_tags(tags)
+                # 已有参考: 允许单码刚体反推 (返程只见一枚仍可出偏差)
+                fused, reason, tag_list = detect_dual_from_tags(
+                    tags, allow_single=True)
                 if fused is not None:
                     g_last_obs = fused
                     g_last_dev = delta_report(fused, g_ref)
-                    g_last_reason = "ok"
+                    g_last_reason = reason
                     g_last_json = align_json_ok(g_last_dev, fused, 0)
                 else:
                     g_last_reason = reason
@@ -1001,20 +1251,23 @@ def capture_preview(encode_jpeg=True):
     return img
 
 
-def capture_detect_update(update_dev=True):
-    """记参考/测一次：取帧→灰度检码→叠图→JPEG。返回 (fused, reason, dt_ms, tags)。"""
+def capture_detect_update(update_dev=True, allow_single=True):
+    """记参考/测一次：取帧→灰度检码→叠图→JPEG。返回 (fused, reason, dt_ms, tags)。
+    allow_single: 测一次/预览可 True; 记参考必须 False(标定强制双码)。"""
     global g_last_obs, g_last_dev, g_last_json, g_last_reason, g_jpeg
     t0 = time.ticks_ms()
     img = g_sensor.snapshot()
     gray = img_for_detect(img)
     tags = gray.find_apriltags(families=TAG_FAMILIES)
-    fused, reason, tag_list = detect_dual_from_tags(tags)
+    # 无参考时单码反推无意义, 强制关
+    use_single = allow_single and (g_ref is not None)
+    fused, reason, tag_list = detect_dual_from_tags(tags, allow_single=use_single)
     dt = time.ticks_diff(time.ticks_ms(), t0)
     if fused is not None:
         g_last_obs = fused
         if update_dev and g_ref is not None:
             g_last_dev = delta_report(fused, g_ref)
-            g_last_reason = "ok"
+            g_last_reason = reason
             g_last_json = align_json_ok(g_last_dev, fused, dt)
         else:
             g_last_reason = reason
@@ -1064,19 +1317,22 @@ def pump_stream_frame():
         stream_drop()
 
 
-def sync_consensus(timeout_ms=CONSENSUS_TIMEOUT_MS):
+def sync_consensus(timeout_ms=CONSENSUS_TIMEOUT_MS, allow_single=True):
     """对齐视觉 /align/ref|/align/once：累计 ALIGN_FRAMES 帧共识（此处才检码）。
     每检一帧后顺手推 MJPEG，避免检测阻塞把流饿死。
+    allow_single=False: 记参考, 必须真实双码。
     """
     reset_consensus_window()
     t0 = time.ticks_ms()
     last_reason = "measuring"
+    last_fused_reason = "ok"
     while time.ticks_diff(time.ticks_ms(), t0) < timeout_ms:
         try:
             os.exitpoint()
         except Exception:
             pass
-        fused, reason, dt, _ = capture_detect_update(update_dev=False)
+        fused, reason, dt, _ = capture_detect_update(
+            update_dev=False, allow_single=allow_single)
         last_reason = reason
         # 检测帧已写入 g_jpeg，间隙推给浏览器
         try:
@@ -1084,9 +1340,12 @@ def sync_consensus(timeout_ms=CONSENSUS_TIMEOUT_MS):
         except Exception:
             pass
         if fused is not None:
+            last_fused_reason = reason
             avg = push_consensus(fused)
             if avg is not None:
-                return avg, "ok", time.ticks_diff(time.ticks_ms(), t0)
+                if "tags_used" in fused:
+                    avg["tags_used"] = fused["tags_used"]
+                return avg, last_fused_reason, time.ticks_diff(time.ticks_ms(), t0)
         else:
             pass
     return None, last_reason, time.ticks_diff(time.ticks_ms(), t0)
@@ -1409,25 +1668,42 @@ def handle_control_client(client):
             clear_ref()
             http_send(client, "200 OK", "application/json", '{"ok":true,"ref":false}')
         else:
-            avg, reason, dt = sync_consensus()
-            if avg is None:
-                body = '{"ok":false,"reason":"%s"}' % reason
-                http_send(client, "200 OK", "application/json", body)
-            else:
-                set_ref_from_obs(avg)
-                # 记参考后偏差必为 0: 立即写入缓存,
-                # App 轮询 /align/get 先拿到零偏差, 再被预览检码刷新
-                g_last_dev = delta_report(avg, g_ref)
-                g_last_reason = "ok"
-                g_last_json = align_json_ok(g_last_dev, avg, dt)
-                body = (
-                    '{"ok":true,"ref":true,"id":%d,"u":%.1f,"v":%.1f,'
-                    '"theta_deg":%.2f,"edge_px":%.1f}'
-                ) % (
-                    int(avg["id"]), avg["u"], avg["v"],
-                    math.degrees(avg["theta"]), avg["edge_a"],
-                )
-                http_send(client, "200 OK", "application/json", body)
+            # 标定强制真实双码。异常必须回 JSON, 否则母机 http 失败 → CV_REF_FAIL。
+            try:
+                for _ in range(2):
+                    try:
+                        g_sensor.snapshot()
+                    except Exception:
+                        break
+                avg, reason, dt = sync_consensus(allow_single=False)
+                if avg is None:
+                    print("[ALIGN-WEB] ref FAIL reason=%s dt=%d" % (reason, int(dt)))
+                    body = '{"ok":false,"reason":"%s"}' % reason
+                    http_send(client, "200 OK", "application/json", body)
+                else:
+                    set_ref_from_obs(avg)
+                    g_last_dev = delta_report(avg, g_ref)
+                    g_last_reason = "ok"
+                    g_last_json = align_json_ok(g_last_dev, avg, dt)
+                    body = (
+                        '{"ok":true,"ref":true,"id":%d,"u":%.1f,"v":%.1f,'
+                        '"theta_deg":%.2f,"edge_px":%.1f}'
+                    ) % (
+                        int(avg["id"]), avg["u"], avg["v"],
+                        math.degrees(avg["theta"]), avg["edge_a"],
+                    )
+                    http_send(client, "200 OK", "application/json", body)
+            except Exception as e:
+                print("[ALIGN-WEB] ref EXC:", type(e).__name__, e)
+                try:
+                    sys.print_exception(e)
+                except Exception:
+                    pass
+                body = '{"ok":false,"reason":"ref_exc_%s"}' % type(e).__name__
+                try:
+                    http_send(client, "200 OK", "application/json", body)
+                except Exception:
+                    pass
     elif path == "/align/once":
         if not g_running:
             vision_start()
@@ -1437,7 +1713,8 @@ def handle_control_client(client):
         elif g_ref is None:
             http_send(client, "200 OK", "application/json", '{"ok":false,"reason":"no_ref"}')
         else:
-            avg, reason, dt = sync_consensus()
+            # 已有参考: 允许只见一枚时刚体反推中点
+            avg, reason, dt = sync_consensus(allow_single=True)
             if avg is None:
                 body = align_json_fail(reason, dt, 0.0)
                 g_last_json = body
@@ -1445,7 +1722,7 @@ def handle_control_client(client):
                 http_send(client, "200 OK", "application/json", body)
             else:
                 g_last_dev = delta_report(avg, g_ref)
-                g_last_reason = "ok"
+                g_last_reason = reason
                 body = align_json_ok(g_last_dev, avg, dt)
                 g_last_json = body
                 http_send(client, "200 OK", "application/json", body)
@@ -1528,7 +1805,13 @@ def run_servers():
         except Exception:
             pass
 
-        # 0) UDP 自动发现: 收 App 询问并应答 + 主动广播自己的 role:ip
+        # 0) STA 掉线重连 (AP 模式空操作)
+        try:
+            wifi_poll_reconnect()
+        except Exception as e:
+            print("[ALIGN-WEB] wifi poll err:", type(e).__name__, e)
+
+        # 1) UDP 自动发现: 收 App 询问并应答 + 主动广播自己的 role:ip
         poll_discovery(udp_disc)
         announce_discovery(udp_disc)
 
@@ -1660,8 +1943,11 @@ def main():
     except Exception:
         pass
     try:
-        wifi_connect()
-        print("[ALIGN-WEB] WiFi up; camera deferred until /align/start")
+        ip = wifi_connect()
+        if ip:
+            print("[ALIGN-WEB] WiFi up ip=%s; camera deferred until /align/start" % ip)
+        else:
+            print("[ALIGN-WEB] WiFi pending; servers start, STA will keep retrying")
         run_servers()
     except KeyboardInterrupt as e:
         print("[ALIGN-WEB] user stop:", e)
