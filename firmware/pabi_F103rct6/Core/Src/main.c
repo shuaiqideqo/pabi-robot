@@ -278,6 +278,9 @@ float roll = 0;
 float yaw = 0;
 float pitch_Compose = 0;
 float roll_Compose = 0;
+/* MODE: 9=手操 10=AUTO 11=KEY7作业(圆轮) 12=KEY8竖爬(圆台)。
+ * Work_PollAbort(744行) 里判 KEY6 要用, 声明必须放在它之前。 */
+int8_t MODE = 9;
 extern float g_dmp_quat[4];              //DMP?(w,x,y,z), inv_mpu.c
 float qref[4] = {1.0f,0.0f,0.0f,0.0f};   //???(Compose_IMU?)
 //pi
@@ -530,7 +533,7 @@ void DUO_Motor_OFF(void){
 static uint8_t g_coop_prefetched = 0;   /* 主循环手动态预取到 COOP, 交给 AUTO() 消费 */
 #define TSTA_CMD  "TSTA"   /* mother->child: enter vision-adj test */
 #define TSTE_CMD  "TSTE"   /* mother->child: exit test */
-static volatile uint8_t g_tsta_pending = 0;   /* outer TSTA/key8, consume in Test_WaitLoop */
+static volatile uint8_t g_tsta_pending = 0;   /* 母机 TSTA, 在 Test_WaitLoop 里消费 */
 
 /* AE 距离结果(Pi 串口→NRF); 变量提前声明供 AUTO 使用 */
 static uint8_t  g_ae_pending = 0;
@@ -753,7 +756,9 @@ static uint8_t Work_PollAbort(void){
     if(Coop_IsProtoFrame(buf)) continue;
     if(buf[1] == 0 && buf[2] == 0 &&
        (buf[5] == 3 || buf[5] == 4 || buf[5] == 6)){
-      FENG_Motor_SET((int8_t)buf[5]);
+      /* KEY8 途中 KEY6 是横爬后退, 不在这里关风机。KEY7 仍关风机。 */
+      if(!(MODE == 12 && buf[5] == 6))
+        FENG_Motor_SET((int8_t)buf[5]);
       continue;
     }
     if(buf[5] == 1 || buf[5] == 5 || buf[5] == 7) continue;
@@ -1390,8 +1395,9 @@ static void PowerOnSelfTest(void){
   
 
 uint8_t DDR_SED[32] = {0};
-/* MODE: 9=手操 10=AUTO 11=作业模式(仅风机+舵机, 轮子锁定); key=7 进入, key=9 退出 */
-int8_t MODE = 9;//9 ??? 10 ???
+/* MODE: 9=手操 10=AUTO 11=KEY7作业(圆轮, 与手操/AUTO同一套轮向)
+ *       12=KEY8竖爬(圆台, 电机在外, 运动和纠偏都单独一套); key=9 退出 */
+/* MODE 定义已上移到文件头部全局区(Work_PollAbort 提前引用) */
 //???? ?? ??????? ?? ????
 uint32_t Flash_Store[2] = {15,78};
 uint32_t Flash_ReadNUM[2] = {0};
@@ -1423,7 +1429,7 @@ uint32_t Flash_ReadNUM[2] = {0};
 #define ADJ_SETTLE_MS       150      /* 段间刹车稳定等待 */
 #define ADJ_DEMO_GAIN       1.0f     /* 调试放大 phi/psi; 默认1=真实角度, 调试可改5 */
 #define ADJ_SLIP_DIFF_MM    50.0f    /* 历史打滑门限; Adj_Move 打滑检测已按用户要求去掉, 此宏暂保留不用 */
-#define ADJ_SELF_TEST       1        /* 1=work-mode key8 enters standalone adj test (TSTA path) */
+/* 独立对位测试只由母机 TSTA 进入。KEY8 进入竖爬 MODE 12, 不进作业模式。 */
 #define ADJ_ST_AXIAL        1
 #define ADJ_ST_SPIN         2
 #define ADJ_ST_MOVE         3
@@ -2044,18 +2050,389 @@ static uint8_t WorkMode_CaptureCycle(void){
   return 0;
 }
 
+/* ===== 竖爬 MODE 12, 只给圆台车(电机在外)。圆轮车的 KEY7/AUTO 不进这里 =====
+ * 手操 KEY8 进入。竖管内是上下, 水平管是前后, 同一套异号轮向, 不看重力换轴。
+ * 运动: PID_IMU_V / WorkMode_AutoClimb, 不调用 PID_IMU、GO_UP。
+ * 自动爬: 按下时标定车头为 0。先开环 20cm, 用这段偏航变化
+ *       算出下一段 20cm 的固定差速。没有积分, 也不中途停车。
+ * 摇杆沿管轴 Arr_RX[2]×2, 封顶 ±200; Arr_RX[1] 转向。摇杆转向只在手控里。
+ * KEY10 横爬/竖爬前进 70cm 速度 200。
+ * KEY5 竖爬后退 70cm 速度 40。KEY6 横爬后退 70cm 速度 200。
+ *       风机 PWM 大于 1239 才起步, 途中掉到此值及以下即停。反向轮速明显高于目标则停车。
+ * 竖管/横管都是编码器平均值到 70cm 就停, 末段 8cm 减速。4m 管分多次按。
+ * 竖管若两边轮子都转不起来, 不等 70cm 也停。
+ * 松杆、风机>=1539、且车身竖起超过 60° 才沿管轴上行。横管松杆不推。 */
+#define VCLIMB_DIST_MM        700.0f
+#define VCLIMB_SPEED          160.0f  /* KEY10 沿管轴正向巡航 */
+#define VCLIMB_MIN_SPEED      100.0f  /* 末段仍留得住竖直管, 不再掉到 25 */
+#define VCLIMB_DOWN_SPEED     40.0f    /* KEY5 竖爬后退: 重力在帮忙 */
+#define VCLIMB_DOWN_MIN_SPEED 15.0f
+#define VCLIMB_SLOW_MM        80.0f    /* 末段 8cm 线性减速 */
+#define VCLIMB_TIMEOUT_MS     120000u
+#define VCLIMB_DOWN_TIMEOUT_MS 60000u
+#define VCLIMB_OVERSPEED      40.0f    /* 下行: 轮速超过目标这么多视为刹不住 */
+#define VCLIMB_OVERSPEED_MS   200u
+#define VCLIMB_WHEEL_CAP      230.0f   /* 轮速上限, 低于电机轴大约 250 转/s */
+#define VCLIMB_SLOW_MAX       16.0f    /* 差速封顶 */
+#define VCLIMB_SLEW           4.0f     /* 差速每 10ms 最多变 4 */
+#define VCLIMB_SEG_MM         200.0f   /* 每段开环长度 */
+#define VCLIMB_SEG_K          10.0f    /* 这段偏航每多 1°, 下一段差速减 10。正偏航往左, 要负差速 */
+#define VCLIMB_UFF_LIM        12.0f    /* 固定差速限幅。只抵消歪轮, 不拿来大角度转弯 */
+#define VCLIMB_OPEN_LOOP      0        /* 0=分段前馈。1=全程差速 0 */
+#define VCLIMB_W_ALPHA        0.30f    /* 角速度低通, 只用于打印 */
+#define VCLIMB_STALL_V        12.0f    /* 竖管: 两边都低于此值视为没在爬 */
+#define VCLIMB_STALL_ARM_MS   1500u    /* 起步预充期间不判停转 */
+#define VCLIMB_STALL_MS       600u
+#define VCLIMB_SLIP_COMP      1.00f    /* 实走/里程计, 卷尺标定后改; 上下行共用 */
+#define VCLIMB_FAN_MIN        1239u    /* KEY5/KEY10: 风机 PWM 必须大于此值 */
+#define VHOLD_FAN_MIN         1539u
+#define VHOLD_STICK_DZ        3
+#define VHOLD_UP_SPEED        40.0f  /* 松杆上行目标, 与反向巡航同量级 */
+#define VHOLD_PWM_MAX         1500   /* 堵转时不允许积分顶满 4199 */
+#define VHOLD_TILT_DEG        60.0f  /* 俯仰或横滚超过此值才算竖管, 横管不推 */
+
+static float g_vhold_ia = 0.0f, g_vhold_ib = 0.0f;
+static uint8_t g_vhold_on = 0;
+static float g_vclimb_q0[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+static uint8_t g_vclimb_q_ok = 0;
+static float g_vclimb_ez = 0.0f;
+static float g_vclimb_ey = 0.0f;
+static float g_vclimb_w = 0.0f;       /* 实测偏航角速度(dps): ez差分+低通, 串口 w= */
+static uint8_t g_vimu_reset = 1;
+static float g_vclimb_uff = 0.0f;     /* 当前这一段的固定差速 */
+static float g_vclimb_seg_z0 = 0.0f;  /* 本段开始时的偏航 */
+
+static void VClimb_HoldReset(void){
+  g_vhold_ia = 0.0f;
+  g_vhold_ib = 0.0f;
+  g_vhold_on = 0;
+}
+
+/* 松杆上行一步(10ms)。轮向与 PID_MA(-40)、PID_MB(+40) 相同。
+ * 轮子不转时误差仍在, 电机持续向上出力, 但 PWM 封在 VHOLD_PWM_MAX。 */
+static void VClimb_HoldStep(void){
+  float va = MA_V_GET();
+  float vb = MB_V_GET();
+  float err, p, u;
+  int pwm;
+  if(!g_vhold_on){
+    g_vhold_on = 1;
+    printf("VHOLD up v=%d pwm<=%d fan=%u\r\n",
+           (int)VHOLD_UP_SPEED, VHOLD_PWM_MAX, (unsigned)FENG_PWM_SET);
+  }
+  /* A: 内部目标 +40 → CH2。平衡时编码器约 +40 */
+  err = VHOLD_UP_SPEED - va;
+  p = 18.0f * err;
+  g_vhold_ia += err * 90.0f * 0.01f;
+  if(g_vhold_ia > (float)VHOLD_PWM_MAX) g_vhold_ia = (float)VHOLD_PWM_MAX;
+  else if(g_vhold_ia < 0.0f) g_vhold_ia = 0.0f;
+  u = p + g_vhold_ia;
+  if(u > (float)VHOLD_PWM_MAX) u = (float)VHOLD_PWM_MAX;
+  else if(u < 0.0f) u = 0.0f;
+  pwm = (int)u;
+  if(pwm > 0){
+    __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, 0);
+    __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_2, (uint16_t)pwm);
+  } else {
+    MA_STOP();
+  }
+  /* B: 内部目标 -40 → CH3。平衡时编码器约 -40 */
+  err = VHOLD_UP_SPEED + vb;
+  p = 18.0f * err;
+  g_vhold_ib += err * 90.0f * 0.01f;
+  if(g_vhold_ib > (float)VHOLD_PWM_MAX) g_vhold_ib = (float)VHOLD_PWM_MAX;
+  else if(g_vhold_ib < 0.0f) g_vhold_ib = 0.0f;
+  u = p + g_vhold_ib;
+  if(u > (float)VHOLD_PWM_MAX) u = (float)VHOLD_PWM_MAX;
+  else if(u < 0.0f) u = 0.0f;
+  pwm = (int)u;
+  if(pwm > 0){
+    __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_3, (uint16_t)pwm);
+    __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_4, 0);
+  } else {
+    MB_STOP();
+  }
+}
+
+static void V_LatchRef(void){
+  g_vclimb_q0[0] = g_dmp_quat[0];
+  g_vclimb_q0[1] = g_dmp_quat[1];
+  g_vclimb_q0[2] = g_dmp_quat[2];
+  g_vclimb_q0[3] = g_dmp_quat[3];
+  g_vclimb_q_ok = 1;
+}
+
+static void V_SnapQuat(void){
+  float p, r, y;
+  if(mpu_dmp_get_data(&p, &r, &y) != 0){
+    g_vclimb_q_ok = 0;
+    return;
+  }
+  V_LatchRef();
+}
+
+/* 相对按下时, 绕机体 Y、绕机体 Z 的转角(度)。起步都是 0。 */
+static void V_RelYZ(float *ey, float *ez){
+  float qw=g_dmp_quat[0], qx=g_dmp_quat[1], qy=g_dmp_quat[2], qz=g_dmp_quat[3];
+  float rw=g_vclimb_q0[0], rx=-g_vclimb_q0[1], ry=-g_vclimb_q0[2], rz=-g_vclimb_q0[3];
+  float w  = rw*qw - rx*qx - ry*qy - rz*qz;
+  float vx = rw*qx + rx*qw + ry*qz - rz*qy;
+  float vy = rw*qy - rx*qz + ry*qw + rz*qx;
+  float vz = rw*qz + rx*qy - ry*qx + rz*qw;
+  *ey = 2.0f*atan2f(vy, sqrtf(w*w+vx*vx+vz*vz))*57.2958f;
+  *ez = 2.0f*atan2f(vz, sqrtf(w*w+vx*vx+vy*vy))*57.2958f;
+}
+
+static float VClimb_CapMag(float cmd, float lim){
+  if(cmd > lim) return lim;
+  if(cmd < -lim) return -lim;
+  return cmd;
+}
+
+/* 读按下后的偏航 ez、法线 ey。法线只记录, 不参与前进时的差速。 */
+static void VClimb_Sense(void){
+  float ez = 0.0f, ey = 0.0f;
+  static float ez_prev = 0.0f;
+  static uint8_t have_prev = 0;
+  if(g_vimu_reset){
+    ez_prev = 0.0f;
+    g_vclimb_w = 0.0f;
+    have_prev = 0;
+    g_vclimb_ez = 0.0f;
+    g_vclimb_ey = 0.0f;
+    g_vimu_reset = 0;
+  }
+  if(mpu_dmp_get_data(&pitch, &roll, &yaw) == 0){
+    if(!g_vclimb_q_ok){
+      V_LatchRef();
+      have_prev = 0;
+    } else {
+      V_RelYZ(&ey, &ez);
+      if(have_prev){
+        float dz = ez - ez_prev;
+        if(dz > 180.0f) dz -= 360.0f;
+        else if(dz < -180.0f) dz += 360.0f;
+        g_vclimb_w = VCLIMB_W_ALPHA * (dz * 100.0f)
+                   + (1.0f - VCLIMB_W_ALPHA) * g_vclimb_w;
+      }
+      ez_prev = ez;
+      have_prev = 1;
+    }
+  }
+  g_vclimb_ez = ez;
+  g_vclimb_ey = ey;
+}
+
+/* 本段用固定差速, 段内不再积分。正 ez = 车头往左, 下一段会减差速。 */
+static void PID_IMU_V(int M_V_nomal)
+{
+  float base = (M_V_nomal >= 0) ? (float)M_V_nomal : (float)(-M_V_nomal);
+  float sign = (M_V_nomal >= 0) ? 1.0f : -1.0f;
+  float steer;
+  static float slew = 0.0f;
+
+  if(g_vimu_reset){
+    slew = 0.0f;
+  }
+  VClimb_Sense();
+  if(base > VCLIMB_WHEEL_CAP) base = VCLIMB_WHEEL_CAP;
+
+  steer = VCLIMB_OPEN_LOOP ? 0.0f : g_vclimb_uff;
+  if(steer > VCLIMB_SLOW_MAX) steer = VCLIMB_SLOW_MAX;
+  else if(steer < -VCLIMB_SLOW_MAX) steer = -VCLIMB_SLOW_MAX;
+  {
+    float dlt = steer - slew;
+    if(dlt > VCLIMB_SLEW) dlt = VCLIMB_SLEW;
+    else if(dlt < -VCLIMB_SLEW) dlt = -VCLIMB_SLEW;
+    slew += dlt;
+    steer = slew;
+  }
+
+  PID_MA(VClimb_CapMag(-sign * base + steer, base));
+  PID_MB(VClimb_CapMag( sign * base + steer, base));
+}
+
+/* 一段走完: 用这段偏航变化修正下一段的固定差速。正偏航(往左)减差速。 */
+static void VClimb_NextSeg(float dist_mm){
+  float dz = g_vclimb_ez - g_vclimb_seg_z0;
+  if(dz > 180.0f) dz -= 360.0f;
+  else if(dz < -180.0f) dz += 360.0f;
+  g_vclimb_uff -= VCLIMB_SEG_K * dz;
+  if(g_vclimb_uff > VCLIMB_UFF_LIM) g_vclimb_uff = VCLIMB_UFF_LIM;
+  else if(g_vclimb_uff < -VCLIMB_UFF_LIM) g_vclimb_uff = -VCLIMB_UFF_LIM;
+  g_vclimb_seg_z0 = g_vclimb_ez;
+  printf("VCLIMB: seg %dmm dz=%d uff=%d z=%d\r\n",
+         (int)dist_mm, (int)dz, (int)g_vclimb_uff, (int)g_vclimb_ez);
+}
+
+/* which: 10=前进200, 5=竖爬后退80, 6=横爬后退200。返回 0=到点 1=拒绝/中止/超时/刹不住/停转 */
+static uint8_t WorkMode_AutoClimb(int which){
+  uint16_t a_old, b_old;
+  float dist = 0.0f, mark = 100.0f;
+  float cruise, vmin;
+  uint32_t t0, loop_time, timeout, over_t0 = 0, stall_t0 = 0;
+  float seg_at = VCLIMB_SEG_MM;
+  int dir = (which == 10) ? 1 : -1;
+  uint8_t stall_on = (which != 6);
+  if(FENG_PWM_SET <= VCLIMB_FAN_MIN){
+    printf("VCLIMB: fan %u <= %u, refused\r\n",
+           (unsigned)FENG_PWM_SET, (unsigned)VCLIMB_FAN_MIN);
+    return 1;
+  }
+  VClimb_HoldReset();
+  g_vimu_reset = 1;
+  g_vclimb_q_ok = 0;
+  V_SnapQuat();
+  if(which != 5){
+    cruise = VCLIMB_SPEED;
+    vmin = VCLIMB_MIN_SPEED;
+    timeout = VCLIMB_TIMEOUT_MS;
+  } else {
+    cruise = VCLIMB_DOWN_SPEED;
+    vmin = VCLIMB_DOWN_MIN_SPEED;
+    timeout = VCLIMB_DOWN_TIMEOUT_MS;
+  }
+  Clear_All_PID();
+  g_vclimb_uff = 0.0f;        /* 第一段纯开环, 用来标定 */
+  g_vclimb_seg_z0 = 0.0f;
+  NRF24L01_RX_Mode();
+  a_old = (uint16_t)__HAL_TIM_GET_COUNTER(&htim2);
+  b_old = (uint16_t)__HAL_TIM_GET_COUNTER(&htim3);
+  t0 = HAL_GetTick();
+  loop_time = micros();
+  printf("VCLIMB: %s %dmm v=%d\r\n",
+         (which == 10) ? "fwd" : (which == 5) ? "vback" : "hback",
+         (int)VCLIMB_DIST_MM, (int)cruise);
+  while(1){
+    float v, rem;
+    int cmd;
+    int16_t da, db;
+    if((uint32_t)(micros() - loop_time) < 10000u){
+      continue;
+    }
+    loop_time = micros();
+    if(Work_PollAbort()){
+      Arr_RX[5] = 0;
+      motor_STOP();
+      Clear_All_PID();
+      printf("VCLIMB: abort @%dmm\r\n", (int)dist);
+      return 1;
+    }
+    if(FENG_PWM_SET <= VCLIMB_FAN_MIN){
+      motor_STOP();
+      Clear_All_PID();
+      printf("VCLIMB: fan %u <= %u, stop @%dmm\r\n",
+             (unsigned)FENG_PWM_SET, (unsigned)VCLIMB_FAN_MIN, (int)dist);
+      return 1;
+    }
+    if((uint32_t)(HAL_GetTick() - t0) >= timeout){
+      motor_STOP();
+      Clear_All_PID();
+      printf("VCLIMB: timeout @%dmm\r\n", (int)dist);
+      return 1;
+    }
+    rem = VCLIMB_DIST_MM - dist;
+    if(rem <= 0.0f){
+      motor_STOP();
+      Clear_All_PID();
+      printf("VCLIMB: done %dmm z=%d y=%d %lums\r\n",
+             (int)dist, (int)g_vclimb_ez, (int)g_vclimb_ey,
+             (unsigned long)(HAL_GetTick() - t0));
+      return 0;
+    }
+    v = cruise;
+    if(rem < VCLIMB_SLOW_MM){
+      v = vmin + (cruise - vmin) * rem / VCLIMB_SLOW_MM;
+    }
+    cmd = (dir > 0) ? (int)v : (int)(-v);   /* 正=KEY10 前进, 负=KEY5/KEY6 后退 */
+    PID_IMU_V(cmd);
+    if(stall_on && (uint32_t)(HAL_GetTick() - t0) >= VCLIMB_STALL_ARM_MS
+       && fabsf(g_wheel_va) < VCLIMB_STALL_V && fabsf(g_wheel_vb) < VCLIMB_STALL_V){
+      if(stall_t0 == 0){
+        stall_t0 = HAL_GetTick();
+      } else if((uint32_t)(HAL_GetTick() - stall_t0) >= VCLIMB_STALL_MS){
+        motor_STOP();
+        Clear_All_PID();
+        printf("VCLIMB: stall @%dmm va=%d vb=%d\r\n",
+               (int)dist, (int)g_wheel_va, (int)g_wheel_vb);
+        return 1;
+      }
+    } else {
+      stall_t0 = 0;
+    }
+    if(dir < 0){
+      float lim = fabsf((float)cmd) + VCLIMB_OVERSPEED;
+      if(fabsf(g_wheel_va) > lim || fabsf(g_wheel_vb) > lim){
+        if(over_t0 == 0){
+          over_t0 = HAL_GetTick();
+        } else if((uint32_t)(HAL_GetTick() - over_t0) >= VCLIMB_OVERSPEED_MS){
+          motor_STOP();
+          Clear_All_PID();
+          printf("VCLIMB: overspeed @%dmm va=%d vb=%d\r\n",
+                 (int)dist, (int)g_wheel_va, (int)g_wheel_vb);
+          return 1;
+        }
+      } else {
+        over_t0 = 0;
+      }
+    }
+    da = (int16_t)((uint16_t)__HAL_TIM_GET_COUNTER(&htim2) - a_old);
+    db = (int16_t)((uint16_t)__HAL_TIM_GET_COUNTER(&htim3) - b_old);
+    a_old = (uint16_t)__HAL_TIM_GET_COUNTER(&htim2);
+    b_old = (uint16_t)__HAL_TIM_GET_COUNTER(&htim3);
+    /* 里程计: 编码器幅值累计(不受轮向符号约定影响), 7计数/电机轴转, 打滑补偿可标定 */
+    dist += (fabsf((float)da) + fabsf((float)db)) * 0.5f / 7.0f
+            * ADJ_MM_PER_MOTORREV * VCLIMB_SLIP_COMP;
+    if(!VCLIMB_OPEN_LOOP && dist >= seg_at){
+      VClimb_NextSeg(dist);
+      seg_at += VCLIMB_SEG_MM;
+    }
+    if(dist >= mark){
+      /* z=按下后绕机体 Z 的角, 应回到 0; y=离线, 只记录; w=实测偏航角速度(dps) */
+      printf("VCLIMB: %dmm z=%d y=%d w=%d va=%d vb=%d\r\n",
+             (int)dist, (int)g_vclimb_ez, (int)g_vclimb_ey, (int)g_vclimb_w,
+             (int)g_wheel_va, (int)g_wheel_vb);
+      mark += 100.0f;
+    }
+    Coop_ReportIMU();
+    Ae_Poll();
+  }
+}
+
+/* KEY7 风机: 按一次 KEY3 逐档加到 1639, 按一次 KEY4 逐档减到 0。
+ * 不走 FENG_Motor_SET, 手操/AUTO/竖爬的一档加减保持原样。 */
+static void WorkMode_FanRamp(int8_t dir){
+  const uint16_t step = 100;
+  if(dir > 0){
+    while(FENG_PWM_SET < 1639u){
+      uint16_t next = (uint16_t)(FENG_PWM_SET + step);
+      if(next < FENG_PWM_SET || next > 1639u) next = 1639u;
+      FENG_PWM_SET = next;
+      __HAL_TIM_SET_COMPARE(&htim5, TIM_CHANNEL_1, FENG_PWM_SET);
+      if(FENG_PWM_SET >= 1639u) break;
+      HAL_Delay(300);
+    }
+  } else {
+    while(FENG_PWM_SET > 0u){
+      uint16_t next = (FENG_PWM_SET > step) ? (uint16_t)(FENG_PWM_SET - step) : 0u;
+      FENG_PWM_SET = next;
+      __HAL_TIM_SET_COMPARE(&htim5, TIM_CHANNEL_1, FENG_PWM_SET);
+      if(FENG_PWM_SET == 0u) break;
+      HAL_Delay(50);
+    }
+  }
+  printf("WORK: fan ramp %s pwm=%u\r\n",
+         (dir > 0) ? "up" : "down", (unsigned)FENG_PWM_SET);
+}
+
 static void ApplyRemoteKey(int8_t key){
   if(key == 0) return;
   if(MODE == 11){
-    /* KEY1/2 探头逐级; KEY3/4/6 风机; KEY5 CAP采集; KEY9退出 */
+    /* 圆轮作业, 与 pabi-robot 一致: KEY1/2 探头; KEY3/4/6 风机; KEY5 CAP; KEY9 退出 */
     if(key == 9){
       MODE = 9;
       Clear_All_PID();
       printf("WORK MODE off\r\n");
-    } else if(key == 8 && ADJ_SELF_TEST){
-      printf("ADJ self test: enter TSTA path\r\n");
-      g_tsta_pending = 1;
-      MODE = 10;
     } else if(key == 1){
       if(!g_work_key_armed) return;
       g_work_key_armed = 0;
@@ -2071,12 +2448,10 @@ static void ApplyRemoteKey(int8_t key){
       g_work_key_armed = 0;
       WorkMode_CaptureCycle();
     } else if(key == 3 || key == 4){
-      /* 与探头一样: 松手再认下一档. 手柄连发时否则几十ms就冲到1800 */
+      /* 按一次: KEY3 逐档到 1639, KEY4 逐档到 0 */
       if(!g_work_key_armed) return;
       g_work_key_armed = 0;
-      FENG_Motor_SET(key);
-      printf("WORK: fan %s pwm=%u\r\n",
-             (key == 3) ? "+1" : "-1", (unsigned)FENG_PWM_SET);
+      WorkMode_FanRamp((key == 3) ? 1 : -1);
     } else if(key == 6){
       if(!g_work_key_armed) return;
       g_work_key_armed = 0;
@@ -2085,12 +2460,57 @@ static void ApplyRemoteKey(int8_t key){
     }
     return;
   }
+  if(MODE == 12){
+    /* 圆台。KEY10 前进(+Y), KEY5 竖爬后退, KEY6 横爬后退(不掉头)。
+     * 车头相对按下时一歪就纠, 收到 0。风机>1239 才走。 */
+    if(key == 9){
+      MODE = 9;
+      VClimb_HoldReset();
+      motor_STOP();
+      Clear_All_PID();
+      printf("VCLIMB MODE off\r\n");
+    } else if(key == 1){
+      if(!g_work_key_armed) return;
+      g_work_key_armed = 0;
+      DUO_Motor_SET(1);
+      printf("VCLIMB: probe +1 pwm=%u\r\n", (unsigned)DUO_PWM_SET);
+    } else if(key == 2){
+      if(!g_work_key_armed) return;
+      g_work_key_armed = 0;
+      DUO_Motor_SET(2);
+      printf("VCLIMB: probe -1 pwm=%u\r\n", (unsigned)DUO_PWM_SET);
+    } else if(key == 3 || key == 4){
+      if(!g_work_key_armed) return;
+      g_work_key_armed = 0;
+      FENG_Motor_SET(key);
+      printf("VCLIMB: fan %s pwm=%u\r\n",
+             (key == 3) ? "+1" : "-1", (unsigned)FENG_PWM_SET);
+    } else if(key == 6){
+      if(!g_work_key_armed) return;
+      g_work_key_armed = 0;
+      WorkMode_AutoClimb(6);
+    } else if(key == 5){
+      if(!g_work_key_armed) return;
+      g_work_key_armed = 0;
+      WorkMode_AutoClimb(5);
+    } else if(key == 10){
+      if(!g_work_key_armed) return;
+      g_work_key_armed = 0;
+      WorkMode_AutoClimb(10);
+    }
+    return;
+  }
   if(key == 9){
     MODE = 9;
   } else if(key == 10){
     MODE = 10;
+  } else if(key == 8){
+    MODE = 12;
+    motor_STOP();
+    Clear_All_PID();
+    printf("VCLIMB MODE on\r\n");
   } else if(key == 7){
-    /* key=7: 进入作业模式(只控风机+舵机), 轮子锁定不动 */
+    /* key=7: 进入圆轮作业模式 */
     MODE = 11;
     motor_STOP();
     Clear_All_PID();
@@ -2496,12 +2916,40 @@ int main(void)
             PID_MB( yawc*2.0f + fwd);
         }
         else if(MODE == 11){
-            /* 作业模式空闲(本版新增): 摇杆前后+原地转向, 与手操同混控;
-               采集保持期间主循环阻塞在保持环里不会到这里, 摇杆仍按 Work_PollAbort 视为中止 */
+            /* 圆轮作业: 与手操、pabi-robot 同一套混控 */
             float fwd  = -(float)Arr_RX[2];
             float yawc =  (float)Arr_RX[1];
             PID_MA(-yawc*2.0f + fwd);
             PID_MB( yawc*2.0f + fwd);
+        }
+        else if(MODE == 12){
+            /* 圆台竖爬: 沿管轴 [2] 异号, 杆量×2 封顶 ±200。
+               [1] 转向取反: 手柄往左时车原来往右偏。
+               竖管松杆且风机>=1539 才上行顶住。横管不推。 */
+            float along = (float)Arr_RX[2] * 2.0f;
+            float steer = -(float)Arr_RX[1];
+            int moving = (Arr_RX[1] > VHOLD_STICK_DZ || Arr_RX[1] < -VHOLD_STICK_DZ
+                       || Arr_RX[2] > VHOLD_STICK_DZ || Arr_RX[2] < -VHOLD_STICK_DZ);
+            int steep = 0;
+            if(along > 200.0f) along = 200.0f;
+            else if(along < -200.0f) along = -200.0f;
+            if(!moving && FENG_PWM_SET >= VHOLD_FAN_MIN
+               && mpu_dmp_get_data(&pitch, &roll, &yaw) == 0){
+              float tilt = fabsf(pitch);
+              if(fabsf(roll) > tilt) tilt = fabsf(roll);
+              if(tilt >= VHOLD_TILT_DEG) steep = 1;
+            }
+            if(steep){
+              VClimb_HoldStep();
+            } else {
+              if(g_vhold_on){
+                VClimb_HoldReset();
+                Clear_All_PID();
+                printf("VHOLD off\r\n");
+              }
+              PID_MA(-along + steer);
+              PID_MB( along + steer);
+            }
         }
     }
 
