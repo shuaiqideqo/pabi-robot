@@ -1,19 +1,19 @@
-"""Existing device web app plus a read-only 10.20 prediction endpoint.
+"""Existing device web app plus a read-only 11.18 prediction endpoint.
 
 Run this file in place of web_server.py. The device-control routes and main.py
 are imported unchanged from web_server.py.
 """
 
+import csv
 import json
 import os
-import shutil
-import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
 
 import psutil
-from flask import jsonify, render_template
+from flask import jsonify, render_template, request
 
 from web_server import DATA_DIR as ORIGINAL_DATA_DIR
 from web_server import PID_FILE, app, is_program_running
@@ -21,12 +21,10 @@ from web_server import PID_FILE, app, is_program_running
 
 HERE = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("PREDICTION_DATA_DIR", ORIGINAL_DATA_DIR))
-PREDICTOR_DIR = Path(os.environ.get("PREDICTOR_DIR", HERE / "predictor_10_20"))
-PREDICTOR_SCRIPT = PREDICTOR_DIR / "live_prediction_10.20.js"
-_bundled_node = PREDICTOR_DIR / "node24" / "bin" / "node"
-NODE_BIN = os.environ.get("NODE_BIN") or (
-    str(_bundled_node) if _bundled_node.is_file() else shutil.which("node")
-)
+PREDICTOR_DIR = HERE / "predictor_11_18"
+PREDICT_PY = PREDICTOR_DIR / "cap_prediction.py"
+PRED_LOG_CSV = Path(os.environ.get("AE_PRED_LOG", HERE / "prediction_log.csv"))
+PRED_LATEST_JSON = Path(os.environ.get("AE_PRED_LATEST", HERE / "latest_prediction.json"))
 _cache_lock = threading.Lock()
 _cache_key = None
 _cache_result = None
@@ -40,6 +38,7 @@ def _response(status, message, capturing=False):
         "eventCount": 0, "waveformCount": 0,
         "result": {"hasPartialDischarge": None, "distanceCm": None, "distanceText": message},
         "quality": {"warnings": []},
+        "modelDataset": "11.18_16V_0-40cm_v2",
     }
 
 
@@ -82,23 +81,21 @@ def _latest_pair(after_ns=0):
 
 
 def _predict_pridb(pridb, capturing):
-    try:
-        process = subprocess.run(
-            [NODE_BIN, str(PREDICTOR_SCRIPT), str(pridb)],
-            cwd=str(PREDICTOR_DIR), text=True, encoding="utf-8",
-            errors="replace", capture_output=True,
-            timeout=10, check=False,
-        )
-        if process.returncode:
-            message = process.stderr.strip() or "预测进程启动失败"
-            result = _response("prediction_unavailable", message[-300:])
-        else:
-            result = json.loads(process.stdout)
-    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
-        result = _response("prediction_unavailable", str(exc))
+    if not PREDICT_PY.is_file():
+        result = _response("prediction_unavailable", "找不到 11.18 预测脚本")
+    else:
+        try:
+            if str(PREDICTOR_DIR) not in sys.path:
+                sys.path.insert(0, str(PREDICTOR_DIR))
+            from cap_prediction import predict as predict_11_18  # type: ignore
+
+            result = predict_11_18(pridb)
+        except Exception as exc:  # noqa: BLE001
+            result = _response("prediction_unavailable", str(exc)[-300:])
     result["sourceFile"] = pridb.name
     result["capturing"] = capturing
-    result["phase"] = "provisional"  # Full waveform review is a later step.
+    result["phase"] = "provisional"
+    result.setdefault("quality", {"warnings": []})
     return result
 
 
@@ -115,8 +112,8 @@ def file_prediction(filename):
     tradb = pridb.with_suffix(".tradb")
     if not tradb.is_file() or tradb.resolve().parent != data_dir:
         return jsonify(_response("waiting_for_tradb", "等待同名 .tradb 波形文件")), 409
-    if not NODE_BIN or not PREDICTOR_SCRIPT.is_file():
-        return jsonify(_response("prediction_unavailable", "找不到 Node.js 或实时预测脚本")), 503
+    if not PREDICT_PY.is_file():
+        return jsonify(_response("prediction_unavailable", "找不到 11.18 预测脚本")), 503
     return jsonify(_predict_pridb(pridb, is_program_running()))
 
 
@@ -134,8 +131,8 @@ def latest_prediction():
     tradb = pridb.with_suffix(".tradb")
     if not tradb.is_file():
         return jsonify(_response("waiting_for_tradb", "等待同名 .tradb 波形文件", True))
-    if not NODE_BIN or not PREDICTOR_SCRIPT.is_file():
-        return jsonify(_response("prediction_unavailable", "找不到 Node.js 或实时预测脚本", True))
+    if not PREDICT_PY.is_file():
+        return jsonify(_response("prediction_unavailable", "找不到 11.18 预测脚本", True))
 
     key = (capture_start_ns, str(pridb), _fingerprint(pridb), _fingerprint(tradb))
     with _cache_lock:
@@ -148,6 +145,47 @@ def latest_prediction():
         _cache_key, _cache_result = key, result
         _cache_retry_at = time.monotonic() + 5
         return jsonify(result)
+
+
+def _read_prediction_history(limit: int = 50):
+    """Read CAP prediction_log.csv, newest first."""
+    if limit < 1:
+        limit = 1
+    if limit > 500:
+        limit = 500
+    if not PRED_LOG_CSV.is_file():
+        return [], "还没有 prediction_log.csv；等 CAP/KEY5/AUTO 跑完预测后会自动生成。"
+    try:
+        with PRED_LOG_CSV.open("r", encoding="utf-8-sig", newline="") as f:
+            rows = list(csv.DictReader(f))
+    except OSError as exc:
+        return [], f"读取失败: {exc}"
+    rows.reverse()
+    return rows[:limit], None
+
+
+@app.route("/api/prediction/history", methods=["GET"])
+def prediction_history():
+    """Historical CAP results from prediction_log.csv for the web panel."""
+    try:
+        limit = int(request.args.get("limit", "50"))
+    except (TypeError, ValueError):
+        limit = 50
+    rows, err = _read_prediction_history(limit)
+    latest = None
+    if PRED_LATEST_JSON.is_file():
+        try:
+            latest = json.loads(PRED_LATEST_JSON.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            latest = None
+    return jsonify({
+        "ok": err is None,
+        "message": err or "",
+        "count": len(rows),
+        "path": str(PRED_LOG_CSV),
+        "latest": latest,
+        "rows": rows,
+    })
 
 
 def index_with_prediction():

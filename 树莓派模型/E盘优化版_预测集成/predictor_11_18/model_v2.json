@@ -1,0 +1,237 @@
+{
+  "model_id": "1118_16V_0_40_refit_v2",
+  "regressor": {
+    "config": {
+      "id": "harmonic_within_group_10",
+      "features": [
+        "log_band",
+        "harmonic_ratio",
+        "harmonic_detected_fraction"
+      ],
+      "mode": "within_group",
+      "alpha": 10.0
+    },
+    "scope": "range",
+    "impute": [
+      2.8029327088432714,
+      -6.0285700152858315,
+      0.0
+    ],
+    "mean": [
+      2.8212316898763508,
+      -6.025799016297469,
+      0.20568181818181816
+    ],
+    "scale": [
+      0.5315917652446374,
+      0.11887559298632047,
+      0.3979204076526438
+    ],
+    "coef": [
+      -5.745716294690304,
+      0.3899241019710925,
+      -2.480651120921301
+    ],
+    "intercept": 25.0,
+    "training_names": [
+      "1",
+      "2",
+      "3",
+      "4",
+      "1-1",
+      "2-1",
+      "3-1",
+      "4-1",
+      "1-2",
+      "2-2",
+      "3-2",
+      "4-2",
+      "1-3",
+      "2-3",
+      "3-3",
+      "4-3",
+      "1-4",
+      "2-4",
+      "3-4",
+      "4-4"
+    ],
+    "training_groups": [
+      1,
+      2,
+      3,
+      4,
+      5
+    ]
+  },
+  "boundary": {
+    "config": {
+      "id": "harmonic_ridge_10",
+      "features": [
+        "log_band",
+        "harmonic_ratio",
+        "harmonic_detected_fraction"
+      ],
+      "mode": "ridge",
+      "alpha": 10.0
+    },
+    "scope": "boundary",
+    "impute": [
+      2.770799737719515,
+      -5.849221361062661,
+      0.0
+    ],
+    "mean": [
+      2.817511174392121,
+      -5.862855208292217,
+      0.25405844155844154
+    ],
+    "scale": [
+      0.6753794575225925,
+      0.12346131599485904,
+      0.4311791910721433
+    ],
+    "coef": [
+      -8.18697272270081,
+      0.27146495952020594,
+      -4.256996150498452
+    ],
+    "intercept": 26.428571428571427,
+    "training_names": [
+      "0",
+      "1",
+      "2",
+      "3",
+      "4",
+      "5",
+      "1-1",
+      "2-1",
+      "3-1",
+      "4-1",
+      "5-1",
+      "1-2",
+      "2-2",
+      "3-2",
+      "4-2",
+      "5-2",
+      "0-3",
+      "1-3",
+      "2-3",
+      "3-3",
+      "4-3",
+      "5-3",
+      "0-4",
+      "1-4",
+      "2-4",
+      "3-4",
+      "4-4",
+      "5-4"
+    ],
+    "training_groups": [
+      1,
+      2,
+      3,
+      4,
+      5
+    ]
+  },
+  "global_error_radius_cm": 9.503243250975672,
+  "boundary_error_radius_cm": 12.261502735036176,
+  "noise_fraction_upper": 0.221428810592661,
+  "training_groups": [
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "deployment_ready": false,
+  "validation": {
+    "nested_regression": {
+      "n": 20,
+      "mae_cm": 6.685943218591079,
+      "max_error_cm": 17.22983249438292,
+      "within8_count": 14,
+      "within8_rate": 0.7
+    },
+    "per_group": {
+      "1": {
+        "n": 4,
+        "mae_cm": 4.425599516188622,
+        "max_error_cm": 6.880637646213245,
+        "within8_count": 4,
+        "within8_rate": 1.0
+      },
+      "2": {
+        "n": 4,
+        "mae_cm": 8.546109389598396,
+        "max_error_cm": 17.22983249438292,
+        "within8_count": 2,
+        "within8_rate": 0.5
+      },
+      "3": {
+        "n": 4,
+        "mae_cm": 6.623793448157915,
+        "max_error_cm": 9.962580763269088,
+        "within8_count": 3,
+        "within8_rate": 0.75
+      },
+      "4": {
+        "n": 4,
+        "mae_cm": 7.633218577877074,
+        "max_error_cm": 15.45896363808546,
+        "within8_count": 3,
+        "within8_rate": 0.75
+      },
+      "5": {
+        "n": 4,
+        "mae_cm": 6.200995161133386,
+        "max_error_cm": 8.689796365502339,
+        "within8_count": 2,
+        "within8_rate": 0.5
+      }
+    },
+    "output_counts": {
+      "distance": 0,
+      "near": 0,
+      "outside": 0,
+      "uncertain": 28,
+      "unreliable": 7
+    },
+    "accepted_numeric": {
+      "n": 0,
+      "mae_cm": null,
+      "max_error_cm": null,
+      "within8_count": 0,
+      "within8_rate": null
+    },
+    "total_files": 35,
+    "range_files": 20,
+    "false_near_files": [],
+    "false_outside_files": [],
+    "far_numeric_files": [],
+    "far_false_near_files": [],
+    "noise_accepted_files": [],
+    "deployment_ready": false,
+    "independent_test": false
+  },
+  "created_at": "2026-11-18T17:44:27.022941",
+  "regression_config": {
+    "id": "harmonic_within_group_10",
+    "features": [
+      "log_band",
+      "harmonic_ratio",
+      "harmonic_detected_fraction"
+    ],
+    "mode": "within_group",
+    "alpha": 10.0
+  },
+  "validation_display": {
+    "raw_regression": {
+      "n": 20,
+      "mae_cm": 6.685943218591079,
+      "max_error_cm": 17.22983249438292,
+      "within_8_count": 14
+    },
+    "deployment_ready": false
+  }
+}

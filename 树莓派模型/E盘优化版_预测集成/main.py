@@ -60,7 +60,7 @@ def main():
         "ddt_us": 100000,
         "pretrigger": 20,
         "preamp_gain": 0,
-        "acq_duration_s": 20
+        "acq_duration_s": 15
     }
 
     config_path = HERE / "config.json"
