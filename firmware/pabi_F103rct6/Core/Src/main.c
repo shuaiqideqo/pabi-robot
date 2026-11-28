@@ -2053,16 +2053,18 @@ static uint8_t WorkMode_CaptureCycle(void){
 /* ===== 竖爬 MODE 12, 只给圆台车(电机在外)。圆轮车的 KEY7/AUTO 不进这里 =====
  * 手操 KEY8 进入。竖管内是上下, 水平管是前后, 同一套异号轮向, 不看重力换轴。
  * 运动: PID_IMU_V / WorkMode_AutoClimb, 不调用 PID_IMU、GO_UP。
- * 自动爬: 按下时标定车头为 0。先开环 20cm, 用这段偏航变化
- *       算出下一段 20cm 的固定差速。没有积分, 也不中途停车。
+ * 自动爬: 按下时车头记为 0。10ms 持续纠偏:
+ *       角度误差→期望角速度, 角速度误差→差速, 积分只在 ±2° 内补歪轮。
+ *       80cm 走完再原地摆正车头。
  * 摇杆沿管轴 Arr_RX[2]×2, 封顶 ±200; Arr_RX[1] 转向。摇杆转向只在手控里。
- * KEY10 横爬/竖爬前进 70cm 速度 200。
- * KEY5 竖爬后退 70cm 速度 40。KEY6 横爬后退 70cm 速度 200。
+ * KEY10 横爬/竖爬前进 80cm。末段 20cm 走完读一次车头, 原地放正。
+ * KEY5 竖爬后退 70cm 速度 40。KEY6 横爬后退 70cm。
  *       风机 PWM 大于 1239 才起步, 途中掉到此值及以下即停。反向轮速明显高于目标则停车。
- * 竖管/横管都是编码器平均值到 70cm 就停, 末段 8cm 减速。4m 管分多次按。
- * 竖管若两边轮子都转不起来, 不等 70cm 也停。
+ * KEY10 到 80cm 停, KEY5/KEY6 到 70cm 停, 末段 8cm 减速。4m 管分多次按。
+ * 竖管若两边轮子都转不起来, 不等到距离也停。
  * 松杆、风机>=1539、且车身竖起超过 60° 才沿管轴上行。横管松杆不推。 */
-#define VCLIMB_DIST_MM        700.0f
+#define VCLIMB_DIST_MM        700.0f   /* KEY5/KEY6 */
+#define VCLIMB_FWD_MM         800.0f   /* KEY10 前进 80cm */
 #define VCLIMB_SPEED          160.0f  /* KEY10 沿管轴正向巡航 */
 #define VCLIMB_MIN_SPEED      100.0f  /* 末段仍留得住竖直管, 不再掉到 25 */
 #define VCLIMB_DOWN_SPEED     40.0f    /* KEY5 竖爬后退: 重力在帮忙 */
@@ -2073,18 +2075,22 @@ static uint8_t WorkMode_CaptureCycle(void){
 #define VCLIMB_OVERSPEED      40.0f    /* 下行: 轮速超过目标这么多视为刹不住 */
 #define VCLIMB_OVERSPEED_MS   200u
 #define VCLIMB_WHEEL_CAP      230.0f   /* 轮速上限, 低于电机轴大约 250 转/s */
-#define VCLIMB_SLOW_MAX       16.0f    /* 差速封顶 */
-#define VCLIMB_SLEW           4.0f     /* 差速每 10ms 最多变 4 */
-#define VCLIMB_SEG_MM         200.0f   /* 每段开环长度 */
-#define VCLIMB_SEG_K          10.0f    /* 这段偏航每多 1°, 下一段差速减 10。正偏航往左, 要负差速 */
-#define VCLIMB_UFF_LIM        12.0f    /* 固定差速限幅。只抵消歪轮, 不拿来大角度转弯 */
-#define VCLIMB_OPEN_LOOP      0        /* 0=分段前馈。1=全程差速 0 */
-#define VCLIMB_W_ALPHA        0.30f    /* 角速度低通, 只用于打印 */
+#define VCLIMB_SLOW_MAX       40.0f    /* 差速封顶。实测 SquareNose 用 ±25 才拧得回, 16 打不过外扰 */
+#define VCLIMB_SLEW           8.0f     /* 差速每 10ms 最多变 8 */
+#define VCLIMB_KP_ANG         5.0f     /* 外环: 每度车头误差 → 5 °/s 期望角速度 */
+#define VCLIMB_W_MAX          40.0f    /* 期望角速度封顶(dps), 须让 W_MAX*KP_RATE 够到 SLOW_MAX */
+#define VCLIMB_KP_RATE        1.0f     /* 内环: 每 dps 角速度误差 → 1.0 差速 */
+#define VCLIMB_KI             2.0f     /* 积分: 抵消风机反扭矩等固定偏转 */
+#define VCLIMB_ILIM           10.0f    /* 积分限幅, 约差速上限的四分之一 */
+#define VCLIMB_I_ZONE         8.0f     /* 车头超过这么多度才停积分并泄掉。2° 太窄, 常偏时积分恒为 0 */
+#define VCLIMB_OPEN_LOOP      0        /* 1=差速恒 0, 用来对照开环直走 */
+#define VCLIMB_W_ALPHA        0.30f    /* 角速度低通。内环反馈用的就是这个 w */
 #define VCLIMB_STALL_V        12.0f    /* 竖管: 两边都低于此值视为没在爬 */
 #define VCLIMB_STALL_ARM_MS   1500u    /* 起步预充期间不判停转 */
 #define VCLIMB_STALL_MS       600u
 #define VCLIMB_SLIP_COMP      1.00f    /* 实走/里程计, 卷尺标定后改; 上下行共用 */
 #define VCLIMB_FAN_MIN        1239u    /* KEY5/KEY10: 风机 PWM 必须大于此值 */
+#define VCLIMB_LOG_MS         20u      /* >0: 爬行中每20ms打一行紧凑遥测(T行), 0=关 */
 #define VHOLD_FAN_MIN         1539u
 #define VHOLD_STICK_DZ        3
 #define VHOLD_UP_SPEED        40.0f  /* 松杆上行目标, 与反向巡航同量级 */
@@ -2099,8 +2105,9 @@ static float g_vclimb_ez = 0.0f;
 static float g_vclimb_ey = 0.0f;
 static float g_vclimb_w = 0.0f;       /* 实测偏航角速度(dps): ez差分+低通, 串口 w= */
 static uint8_t g_vimu_reset = 1;
-static float g_vclimb_uff = 0.0f;     /* 当前这一段的固定差速 */
-static float g_vclimb_seg_z0 = 0.0f;  /* 本段开始时的偏航 */
+static float g_vclimb_steer = 0.0f;   /* 本拍实际差速, 串口打印 */
+static float g_vclimb_i = 0.0f;        /* 歪轮积分 */
+static float g_vclimb_wcmd = 0.0f;     /* 外环给出的期望角速度(dps) */
 
 static void VClimb_HoldReset(void){
   g_vhold_ia = 0.0f;
@@ -2218,26 +2225,47 @@ static void VClimb_Sense(void){
       ez_prev = ez;
       have_prev = 1;
     }
+    g_vclimb_ez = ez;
+    g_vclimb_ey = ey;
   }
-  g_vclimb_ez = ez;
-  g_vclimb_ey = ey;
 }
 
-/* 本段用固定差速, 段内不再积分。正 ez = 车头往左, 下一段会减差速。 */
+/* 串级航向保持, 每 10ms。正 ez = 车头往左, 要正差速把它拧回来(本车 cmd 镜像)。
+ * 外环出期望角速度, 内环用实测角速度 w 阻尼, 积分只记歪轮要的固定差速。 */
 static void PID_IMU_V(int M_V_nomal)
 {
   float base = (M_V_nomal >= 0) ? (float)M_V_nomal : (float)(-M_V_nomal);
   float sign = (M_V_nomal >= 0) ? 1.0f : -1.0f;
-  float steer;
+  float e, w_cmd, steer;
   static float slew = 0.0f;
+  static float i_term = 0.0f;
 
   if(g_vimu_reset){
     slew = 0.0f;
+    i_term = 0.0f;
   }
   VClimb_Sense();
   if(base > VCLIMB_WHEEL_CAP) base = VCLIMB_WHEEL_CAP;
 
-  steer = VCLIMB_OPEN_LOOP ? 0.0f : g_vclimb_uff;
+  e = -g_vclimb_ez;
+  if(VCLIMB_OPEN_LOOP){
+    i_term = 0.0f;
+    w_cmd = 0.0f;
+    steer = 0.0f;
+  } else {
+    /* 只在车头靠近 0 时记歪轮。偏大就泄掉积分, 免得积满后把车头锁在一个方向。 */
+    if(fabsf(g_vclimb_ez) <= VCLIMB_I_ZONE){
+      i_term += e * VCLIMB_KI * 0.01f;
+      if(i_term > VCLIMB_ILIM) i_term = VCLIMB_ILIM;
+      else if(i_term < -VCLIMB_ILIM) i_term = -VCLIMB_ILIM;
+    } else {
+      i_term *= 0.90f;
+    }
+    w_cmd = VCLIMB_KP_ANG * e;
+    if(w_cmd > VCLIMB_W_MAX) w_cmd = VCLIMB_W_MAX;
+    else if(w_cmd < -VCLIMB_W_MAX) w_cmd = -VCLIMB_W_MAX;
+    steer = VCLIMB_KP_RATE * (w_cmd - g_vclimb_w) + i_term;
+  }
   if(steer > VCLIMB_SLOW_MAX) steer = VCLIMB_SLOW_MAX;
   else if(steer < -VCLIMB_SLOW_MAX) steer = -VCLIMB_SLOW_MAX;
   {
@@ -2247,22 +2275,50 @@ static void PID_IMU_V(int M_V_nomal)
     slew += dlt;
     steer = slew;
   }
+  g_vclimb_steer = steer;
+  g_vclimb_i = i_term;
+  g_vclimb_wcmd = w_cmd;
 
-  PID_MA(VClimb_CapMag(-sign * base + steer, base));
-  PID_MB(VClimb_CapMag( sign * base + steer, base));
+  /* 差速必须取负: 本车 cmd 空间是镜像的, steer 同号加到两轮才是转向。
+     实测(见 SquareNose): 正差速让 ez 减小, 与旧注释写的相反。 */
+  PID_MA(VClimb_CapMag(-sign * base - steer, base));
+  PID_MB(VClimb_CapMag( sign * base - steer, base));
 }
 
-/* 一段走完: 用这段偏航变化修正下一段的固定差速。正偏航(往左)减差速。 */
-static void VClimb_NextSeg(float dist_mm){
-  float dz = g_vclimb_ez - g_vclimb_seg_z0;
-  if(dz > 180.0f) dz -= 360.0f;
-  else if(dz < -180.0f) dz += 360.0f;
-  g_vclimb_uff -= VCLIMB_SEG_K * dz;
-  if(g_vclimb_uff > VCLIMB_UFF_LIM) g_vclimb_uff = VCLIMB_UFF_LIM;
-  else if(g_vclimb_uff < -VCLIMB_UFF_LIM) g_vclimb_uff = -VCLIMB_UFF_LIM;
-  g_vclimb_seg_z0 = g_vclimb_ez;
-  printf("VCLIMB: seg %dmm dz=%d uff=%d z=%d\r\n",
-         (int)dist_mm, (int)dz, (int)g_vclimb_uff, (int)g_vclimb_ez);
+/* 最后一段走完后读车头, 原地转回按下时的方向。实测: 正 ez 要打正速度(两轮同号)。 */
+static uint8_t VClimb_SquareNose(void){
+  uint32_t t0, loop, sq_log = 0;
+  motor_STOP();
+  Clear_All_PID();
+  VClimb_Sense();
+  printf("VCLIMB: square read z=%d\r\n", (int)g_vclimb_ez);
+  t0 = HAL_GetTick();
+  loop = micros();
+  while(fabsf(g_vclimb_ez) > 1.0f && (uint32_t)(HAL_GetTick() - t0) < 2000u){
+    float s;
+    if((uint32_t)(micros() - loop) < 10000u) continue;
+    loop = micros();
+    if(Work_PollAbort()){
+      Arr_RX[5] = 0;
+      motor_STOP();
+      Clear_All_PID();
+      return 1;
+    }
+    VClimb_Sense();
+    s = 8.0f * g_vclimb_ez;   /* 实测: 正 ez 打正速度才转得回来, 反了越拧越歪 */
+    if(s > 25.0f) s = 25.0f;
+    else if(s < -25.0f) s = -25.0f;
+    PID_MA(s);
+    PID_MB(s);
+    if((uint32_t)(HAL_GetTick() - sq_log) >= 100u){
+      sq_log = HAL_GetTick();
+      printf("SQ %d %d\r\n", (int)(g_vclimb_ez * 10.0f), (int)s);
+    }
+  }
+  motor_STOP();
+  Clear_All_PID();
+  printf("VCLIMB: square done z=%d\r\n", (int)g_vclimb_ez);
+  return 0;
 }
 
 /* which: 10=前进200, 5=竖爬后退80, 6=横爬后退200。返回 0=到点 1=拒绝/中止/超时/刹不住/停转 */
@@ -2270,8 +2326,8 @@ static uint8_t WorkMode_AutoClimb(int which){
   uint16_t a_old, b_old;
   float dist = 0.0f, mark = 100.0f;
   float cruise, vmin;
-  uint32_t t0, loop_time, timeout, over_t0 = 0, stall_t0 = 0;
-  float seg_at = VCLIMB_SEG_MM;
+  uint32_t t0, loop_time, timeout, over_t0 = 0, stall_t0 = 0, log_t0 = 0;
+  float goal = (which == 10) ? VCLIMB_FWD_MM : VCLIMB_DIST_MM;
   int dir = (which == 10) ? 1 : -1;
   uint8_t stall_on = (which != 6);
   if(FENG_PWM_SET <= VCLIMB_FAN_MIN){
@@ -2293,8 +2349,9 @@ static uint8_t WorkMode_AutoClimb(int which){
     timeout = VCLIMB_DOWN_TIMEOUT_MS;
   }
   Clear_All_PID();
-  g_vclimb_uff = 0.0f;        /* 第一段纯开环, 用来标定 */
-  g_vclimb_seg_z0 = 0.0f;
+  g_vclimb_steer = 0.0f;
+  g_vclimb_i = 0.0f;
+  g_vclimb_wcmd = 0.0f;
   NRF24L01_RX_Mode();
   a_old = (uint16_t)__HAL_TIM_GET_COUNTER(&htim2);
   b_old = (uint16_t)__HAL_TIM_GET_COUNTER(&htim3);
@@ -2302,7 +2359,7 @@ static uint8_t WorkMode_AutoClimb(int which){
   loop_time = micros();
   printf("VCLIMB: %s %dmm v=%d\r\n",
          (which == 10) ? "fwd" : (which == 5) ? "vback" : "hback",
-         (int)VCLIMB_DIST_MM, (int)cruise);
+         (int)goal, (int)cruise);
   while(1){
     float v, rem;
     int cmd;
@@ -2331,8 +2388,12 @@ static uint8_t WorkMode_AutoClimb(int which){
       printf("VCLIMB: timeout @%dmm\r\n", (int)dist);
       return 1;
     }
-    rem = VCLIMB_DIST_MM - dist;
+    rem = goal - dist;
     if(rem <= 0.0f){
+      if(which == 10 && VClimb_SquareNose()){
+        printf("VCLIMB: square abort @%dmm\r\n", (int)dist);
+        return 1;
+      }
       motor_STOP();
       Clear_All_PID();
       printf("VCLIMB: done %dmm z=%d y=%d %lums\r\n",
@@ -2383,9 +2444,13 @@ static uint8_t WorkMode_AutoClimb(int which){
     /* 里程计: 编码器幅值累计(不受轮向符号约定影响), 7计数/电机轴转, 打滑补偿可标定 */
     dist += (fabsf((float)da) + fabsf((float)db)) * 0.5f / 7.0f
             * ADJ_MM_PER_MOTORREV * VCLIMB_SLIP_COMP;
-    if(!VCLIMB_OPEN_LOOP && dist >= seg_at){
-      VClimb_NextSeg(dist);
-      seg_at += VCLIMB_SEG_MM;
+    if(VCLIMB_LOG_MS && (uint32_t)(HAL_GetTick() - log_t0) >= VCLIMB_LOG_MS){
+      log_t0 = HAL_GetTick();
+      /* T: 里程 车头x10 离线x10 角速度 va vb 差速 积分x10 期望角速度 */
+      printf("T %d %d %d %d %d %d %d %d %d\r\n",
+             (int)dist, (int)(g_vclimb_ez * 10.0f), (int)(g_vclimb_ey * 10.0f),
+             (int)g_vclimb_w, (int)g_wheel_va, (int)g_wheel_vb,
+             (int)g_vclimb_steer, (int)(g_vclimb_i * 10.0f), (int)g_vclimb_wcmd);
     }
     if(dist >= mark){
       /* z=按下后绕机体 Z 的角, 应回到 0; y=离线, 只记录; w=实测偏航角速度(dps) */
